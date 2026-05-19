@@ -1,0 +1,14 @@
+node_modules
+dist
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage
+.vitest-cache
+.idea
+.vscode
+*.swp
+src/proto/
