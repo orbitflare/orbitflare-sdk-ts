@@ -1,6 +1,6 @@
 import bs58 from 'bs58';
 
-import { JetstreamClientBuilder } from '@orbitflare/sdk';
+import { JetstreamClientBuilder } from '@orbitflare/sdk/jetstream';
 
 async function main() {
   const client = new JetstreamClientBuilder().url('http://ams.jetstream.orbitflare.com').build();

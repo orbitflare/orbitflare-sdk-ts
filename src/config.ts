@@ -1,7 +1,22 @@
 import { readFileSync } from 'node:fs';
-import { parse as parseYaml } from 'yaml';
+import { createRequire } from 'node:module';
 
 import { OrbitflareError } from './error.js';
+
+const requireFromHere = createRequire(import.meta.url);
+let cachedYaml: typeof import('yaml') | undefined;
+function loadYaml(): typeof import('yaml') {
+  if (!cachedYaml) {
+    try {
+      cachedYaml = requireFromHere('yaml') as typeof import('yaml');
+    } catch {
+      throw OrbitflareError.config(
+        "the 'yaml' peer dependency is required for YAML config loaders. Install with: npm install yaml",
+      );
+    }
+  }
+  return cachedYaml;
+}
 import {
   CommitmentLevel,
   type SubscribeRequest as GeyserSubscribeRequest,
@@ -61,7 +76,7 @@ function readYaml<T>(path: string): T {
   }
   const expanded = expandEnv(raw);
   try {
-    return parseYaml(expanded) as T;
+    return loadYaml().parse(expanded) as T;
   } catch (e: any) {
     throw OrbitflareError.config(`failed to parse yaml: ${e?.message ?? e}`);
   }

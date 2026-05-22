@@ -1,6 +1,6 @@
 import bs58 from 'bs58';
 
-import { GeyserClientBuilder } from '@orbitflare/sdk';
+import { GeyserClientBuilder } from '@orbitflare/sdk/grpc';
 
 async function main() {
   const client = new GeyserClientBuilder().url('http://ams.rpc.orbitflare.com:10000').build();

@@ -1,4 +1,4 @@
-import { WsClientBuilder } from '@orbitflare/sdk';
+import { WsClientBuilder } from '@orbitflare/sdk/ws';
 
 async function main() {
   const client = await new WsClientBuilder().url('ws://ams.rpc.orbitflare.com').build();

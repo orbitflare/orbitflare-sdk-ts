@@ -83,7 +83,7 @@ commitment: confirmed
 ```
 
 ```ts
-import { GeyserClientBuilder } from '@orbitflare/sdk';
+import { GeyserClientBuilder } from '@orbitflare/sdk/grpc';
 
 const client = new GeyserClientBuilder()
   .url('http://ny.rpc.orbitflare.com:10000')
@@ -111,7 +111,7 @@ transactions:
 ```
 
 ```ts
-import { JetstreamClientBuilder } from '@orbitflare/sdk';
+import { JetstreamClientBuilder } from '@orbitflare/sdk/jetstream';
 
 const client = new JetstreamClientBuilder()
   .url('http://ny.jetstream.orbitflare.com')
@@ -129,7 +129,7 @@ for await (const update of stream) {
 ## WebSocket
 
 ```ts
-import { WsClientBuilder } from '@orbitflare/sdk';
+import { WsClientBuilder } from '@orbitflare/sdk/ws';
 
 const client = await new WsClientBuilder()
   .url('ws://ny.rpc.orbitflare.com')
