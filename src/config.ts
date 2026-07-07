@@ -26,7 +26,6 @@ import {
 } from './proto/geyser.js';
 import {
   type SubscribeRequest as JetstreamSubscribeRequest,
-  type SubscribeRequestFilterAccounts as JetAccountFilter,
   type SubscribeRequestFilterTransactions as JetTxFilter,
 } from './proto/jetstream.js';
 
@@ -56,7 +55,6 @@ export interface GeyserStreamConfig {
 
 export interface JetstreamStreamConfig {
   transactions?: Record<string, TransactionFilter>;
-  accounts?: Record<string, AccountFilter>;
 }
 
 export function loadGeyserConfig(path: string): GeyserStreamConfig {
@@ -159,18 +157,9 @@ export function jetstreamConfigToRequest(cfg: JetstreamStreamConfig): JetstreamS
     };
   }
 
-  const accounts: Record<string, JetAccountFilter> = {};
-  for (const [name, f] of Object.entries(cfg.accounts ?? {})) {
-    accounts[name] = {
-      account: f.account ?? [],
-      owner: f.owner ?? [],
-      filters: [],
-    };
-  }
-
   return {
     transactions,
-    accounts,
+    accounts: {},
     ping: { id: 1 },
   } as JetstreamSubscribeRequest;
 }

@@ -9,6 +9,15 @@ export {
 export { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
 
 export {
+  createConsoleLogger,
+  NOOP_LOGGER,
+  resolveLogger,
+  type LogFields,
+  type Logger,
+  type LogLevel,
+} from './logger.js';
+
+export {
   RpcClient,
   RpcClientBuilder,
   type GetTransactionsFilters,

@@ -1,0 +1,204 @@
+syntax = "proto3";
+
+package jetstream.v2;
+
+import "google/protobuf/timestamp.proto";
+
+service JetstreamV2 {
+  rpc SubscribeTransactions(stream SubscribeTransactionsRequest) returns (stream SubscribeTransactionsResponse) {}
+
+  // Server-streaming slot lifecycle events.
+  rpc SubscribeSlots(SubscribeSlotsRequest) returns (stream SlotEvent) {}
+
+  // Unary health/version probes.
+  rpc Ping(PingRequest) returns (PongResponse) {}
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse) {}
+}
+
+// ============= Request =============
+
+message SubscribeTransactionsRequest {
+  oneof payload {
+    Ping          ping           = 1;
+    AddFilters    add_filters    = 2;
+    RemoveFilters remove_filters = 3;
+  }
+}
+
+message Ping {
+  int32 ping_id = 1;
+}
+
+message AddFilters {
+  repeated TxFilter filters = 1;
+}
+
+message TxFilter {
+  string                             filter_id = 1;  // client-provided, max 127 chars
+  SubscribeRequestFilterTransactions filter    = 2;
+}
+
+message SubscribeRequestFilterTransactions {
+  repeated string account_include  = 1;
+  repeated string account_exclude  = 2;
+  repeated string account_required = 3;
+
+  // Opt-in enrichment. Default false = lean response (core fields only). Set
+  // true to also receive fee_payer / writable_accounts / program_ids /
+  // compute_unit_price / compute_limit / tx_size. Applies to the whole
+  // subscription: if any of your active filters sets this true, every
+  // transaction you receive is enriched.
+  bool include_enrichment = 4;
+}
+
+message RemoveFilters {
+  repeated string filter_ids = 1;
+}
+
+// ============= Response =============
+
+message SubscribeTransactionsResponse {
+  google.protobuf.Timestamp created_at = 1;
+
+  oneof payload {
+    FilteredTransaction transaction       = 2;
+    Pong                pong              = 3;
+    FilterResult        filter_validation = 5;
+    Heartbeat           heartbeat         = 6;
+  }
+
+  uint64 sequence = 4;
+}
+
+message Pong {
+  int32 ping_id = 1;
+}
+
+message FilterResult {
+  string filter_id        = 1;
+  bool   accepted         = 2;
+  string rejection_reason = 3;  // empty string when accepted=true (proto3 default elision)
+}
+
+message Heartbeat {
+  // Server wall-clock at emit time, milliseconds since Unix epoch. Lets
+  // clients measure one-way skew / network delay and age out stale
+  // connections.
+  uint64 server_ts_ms = 1;
+}
+
+message FilteredTransaction {
+  repeated string    filter_ids  = 1;
+  TransactionMessage transaction = 2;
+}
+
+// TransactionMessage — a flat transaction representation (all fields inline).
+// Fields 1-13 are the core transaction and are always present (the default
+// "lean" output). Fields 14-21 are optional enrichment, emitted only when the
+// session opts in via SubscribeRequestFilterTransactions.include_enrichment.
+message TransactionMessage {
+  // Identity / placement
+  uint64 slot      = 1;
+  bytes  signature = 2;  // primary signature (signatures[0])
+  uint32 tx_index  = 3;  // position of this tx within its entry
+
+  // Full signature set (repeated bytes)
+  repeated bytes signatures = 4;
+
+  // Vote flag
+  bool is_vote = 5;
+
+  // Message header
+  uint32 num_required_signatures        = 6;
+  uint32 num_readonly_signed_accounts   = 7;
+  uint32 num_readonly_unsigned_accounts = 8;
+
+  // Recent blockhash
+  bytes recent_blockhash = 9;
+
+  // Versioned-transaction flag.
+  bool versioned = 10;
+
+  // Core body contents
+  repeated bytes                     account_keys          = 11;
+  repeated CompiledInstruction       instructions          = 12;
+  repeated MessageAddressTableLookup address_table_lookups = 13;
+
+  // Enrichment — emitted only when the session opts in via
+  // SubscribeRequestFilterTransactions.include_enrichment.
+  bytes          fee_payer         = 14;
+  repeated bytes writable_accounts = 15;
+  repeated bytes program_ids       = 16;
+  uint64         compute_unit_price = 17;  // compute-unit price, micro-lamports per CU (from SetComputeUnitPrice); 0 if unset. NOT the total priority fee.
+  uint32         compute_limit     = 18;
+  uint32         tx_size           = 19;
+
+  // Resolved addresses from a versioned tx's address_table_lookups. Emitted
+  // only when enrichment is opted in (same gate as fields 14-19). Empty for a
+  // legacy (non-versioned) tx; when a lookup can't be fully resolved,
+  // alt_resolution_incomplete (field 22) is set and any addresses that did
+  // resolve are still included.
+  repeated bytes loaded_writable_addresses = 20;
+  repeated bytes loaded_readonly_addresses = 21;
+
+  // Set true when one or more of this transaction's address_table_lookups could
+  // NOT be fully resolved, so the loaded_writable_addresses /
+  // loaded_readonly_addresses above are INCOMPLETE. When true, resolve the tx's
+  // accounts yourself from address_table_lookups (fetch the tables via
+  // getMultipleAccounts). Default false = fully resolved. Emitted only under
+  // enrichment (same gate as fields 14-21).
+  bool alt_resolution_incomplete = 22;
+}
+
+message CompiledInstruction {
+  uint32 program_id_index = 1;
+  bytes  accounts         = 2;
+  bytes  data             = 3;
+}
+
+message MessageAddressTableLookup {
+  bytes account_key      = 1;
+  bytes writable_indexes = 2;
+  bytes readonly_indexes = 3;
+}
+
+// ============= SubscribeSlots =============
+
+// SubscribeSlots takes no request parameters.
+message SubscribeSlotsRequest {
+}
+
+enum SlotStatus {
+  SLOT_STATUS_UNSPECIFIED = 0;
+  SLOT_STATUS_ALIVE       = 1;  // first shred of this slot received
+  SLOT_STATUS_COMPLETE    = 2;  // last shred of this slot received
+  SLOT_STATUS_DEAD        = 3;  // slot skipped, or superseded by later slots without completing
+}
+
+message SlotEvent {
+  uint64     slot           = 1;
+  SlotStatus status         = 2;
+  // 32-byte pubkey. Empty bytes (proto3 default) means the current leader is
+  // unavailable.
+  bytes      current_leader = 3;
+  // Parent slot, from the first shred received for this slot. 0 means
+  // "unknown parent" (e.g. a DEAD event for a slot that was never observed).
+  uint64     parent_slot    = 4;
+  uint64     sequence       = 5;  // monotonic per-stream
+}
+
+// ============= Unary RPC messages =============
+
+message PingRequest {
+  int32 count = 1;
+}
+
+message PongResponse {
+  int32 count = 1;
+}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string version = 1;
+}

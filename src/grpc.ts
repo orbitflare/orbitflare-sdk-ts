@@ -2,14 +2,25 @@ import { type ClientDuplexStream, type ClientOptions } from '@grpc/grpc-js';
 
 import { parseAddress } from './address.js';
 import { EndpointSet } from './endpoint.js';
-import { OrbitflareError } from './error.js';
+import { OrbitflareError, sanitizeUrl } from './error.js';
+import { type Logger, type LogLevel, resolveLogger } from './logger.js';
 import { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
 import {
   GeyserClient as ProtoGeyserClient,
   type SubscribeRequest,
+  type SubscribeRequestFilterAccounts,
+  type SubscribeRequestFilterAccountsFilter,
+  type SubscribeRequestFilterBlocks,
+  type SubscribeRequestFilterDeshredTransactions,
+  type SubscribeRequestFilterSlots,
+  type SubscribeRequestFilterTransactions,
   type SubscribeUpdate,
 } from './proto/geyser.js';
 import { geyserConfigToRequest, loadGeyserConfig } from './config.js';
+import { Commitment, Lamports, Memcmp } from './filters.js';
+
+export { Commitment, Lamports, Memcmp } from './filters.js';
+export type { LamportsCmp, MemcmpData } from './filters.js';
 
 const DEFAULT_PING_INTERVAL_SECS = 10;
 const DEFAULT_MAX_MISSED_PONGS = 3;
@@ -74,6 +85,7 @@ interface GeyserClientOptions {
   pingIntervalSecs: number;
   maxMissedPongs: number;
   channelCapacity: number;
+  logger: Logger;
 }
 
 export class GeyserClient {
@@ -90,15 +102,27 @@ export class GeyserClient {
     });
     let shutdownRequested = false;
 
+    const { logger } = this.opts;
     void (async () => {
       let attempt = 0;
       while (!shutdownRequested) {
         attempt += 1;
         const idx = this.opts.endpoints.pick();
         const url = this.opts.endpoints.get(idx);
+        logger.info('connecting (grpc)', { endpoint: sanitizeUrl(url), attempt });
 
         try {
-          await runConnection(url, request, stream, this.opts, () => shutdownRequested);
+          await runConnection(
+            url,
+            request,
+            stream,
+            this.opts,
+            () => shutdownRequested,
+            () => {
+              attempt = 0;
+              logger.info('connected, streaming (grpc)');
+            },
+          );
           this.opts.endpoints.markSuccess(idx);
           return;
         } catch (e) {
@@ -108,7 +132,14 @@ export class GeyserClient {
             stream._fail(err.withEndpoint(url));
             return;
           }
-          await sleep(delayForAttempt(this.opts.retry, attempt));
+          const delayMs = delayForAttempt(this.opts.retry, attempt);
+          logger.warn('reconnecting (grpc)', {
+            error: err,
+            endpoint: sanitizeUrl(url),
+            attempt,
+            delayMs,
+          });
+          await sleep(delayMs);
         }
       }
     })();
@@ -123,6 +154,7 @@ async function runConnection(
   stream: GeyserStream,
   opts: GeyserClientOptions,
   shouldShutdown: () => boolean,
+  onConnected: () => void,
 ): Promise<void> {
   const { target, credentials } = parseAddress(url);
   const clientOpts: Partial<ClientOptions> = {
@@ -142,6 +174,7 @@ async function runConnection(
 
   let missedPongs = 0;
   let pingId = 1;
+  let connected = false;
   let pingTimer: NodeJS.Timeout | undefined;
   let resolveDone: () => void;
   let rejectDone: (err: OrbitflareError) => void;
@@ -159,6 +192,10 @@ async function runConnection(
   };
 
   call.on('data', (update: SubscribeUpdate) => {
+    if (!connected) {
+      connected = true;
+      onConnected();
+    }
     if (update.pong) {
       missedPongs = 0;
       return;
@@ -232,9 +269,21 @@ export class GeyserClientBuilder {
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
   private _channelCapacity = 4096;
+  private _logger?: Logger;
+  private _logLevel?: LogLevel;
 
   url(url: string): this {
     this._url = url;
+    return this;
+  }
+
+  logger(logger: Logger): this {
+    this._logger = logger;
+    return this;
+  }
+
+  logLevel(level: LogLevel): this {
+    this._logLevel = level;
     return this;
   }
 
@@ -301,6 +350,322 @@ export class GeyserClientBuilder {
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
       channelCapacity: this._channelCapacity,
+      logger: resolveLogger(this._logger, this._logLevel),
     });
+  }
+}
+
+function memcmpToProto(m: Memcmp): SubscribeRequestFilterAccountsFilter['memcmp'] {
+  const offset = BigInt(m.offset);
+  if ('bytes' in m.data) return { offset, bytes: m.data.bytes };
+  if ('base58' in m.data) return { offset, base58: m.data.base58 };
+  return { offset, base64: m.data.base64 };
+}
+
+function lamportsToProto(l: Lamports): SubscribeRequestFilterAccountsFilter['lamports'] {
+  const c = l.cmp;
+  if ('eq' in c) return { eq: BigInt(c.eq) };
+  if ('ne' in c) return { ne: BigInt(c.ne) };
+  if ('lt' in c) return { lt: BigInt(c.lt) };
+  return { gt: BigInt(c.gt) };
+}
+
+type AccountCondition =
+  | { kind: 'memcmp'; memcmp: Memcmp }
+  | { kind: 'datasize'; datasize: number }
+  | { kind: 'tokenAccountState'; state: boolean }
+  | { kind: 'lamports'; lamports: Lamports };
+
+export class TransactionFilter {
+  private _vote?: boolean;
+  private _failed?: boolean;
+  private _signature?: string;
+  private _accountInclude: string[] = [];
+  private _accountExclude: string[] = [];
+  private _accountRequired: string[] = [];
+
+  vote(vote: boolean): this {
+    this._vote = vote;
+    return this;
+  }
+
+  failed(failed: boolean): this {
+    this._failed = failed;
+    return this;
+  }
+
+  signature(signature: string): this {
+    this._signature = signature;
+    return this;
+  }
+
+  accountInclude(accounts: string[]): this {
+    this._accountInclude.push(...accounts);
+    return this;
+  }
+
+  accountExclude(accounts: string[]): this {
+    this._accountExclude.push(...accounts);
+    return this;
+  }
+
+  accountRequired(accounts: string[]): this {
+    this._accountRequired.push(...accounts);
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterTransactions {
+    return {
+      vote: this._vote,
+      failed: this._failed,
+      signature: this._signature,
+      accountInclude: this._accountInclude,
+      accountExclude: this._accountExclude,
+      accountRequired: this._accountRequired,
+    };
+  }
+}
+
+export class AccountFilter {
+  private _account: string[] = [];
+  private _owner: string[] = [];
+  private _conditions: AccountCondition[] = [];
+  private _nonemptyTxnSignature?: boolean;
+
+  account(accounts: string[]): this {
+    this._account.push(...accounts);
+    return this;
+  }
+
+  owner(owners: string[]): this {
+    this._owner.push(...owners);
+    return this;
+  }
+
+  memcmp(memcmp: Memcmp): this {
+    this._conditions.push({ kind: 'memcmp', memcmp });
+    return this;
+  }
+
+  datasize(datasize: number): this {
+    this._conditions.push({ kind: 'datasize', datasize });
+    return this;
+  }
+
+  tokenAccountState(state: boolean): this {
+    this._conditions.push({ kind: 'tokenAccountState', state });
+    return this;
+  }
+
+  lamports(lamports: Lamports): this {
+    this._conditions.push({ kind: 'lamports', lamports });
+    return this;
+  }
+
+  nonemptyTxnSignature(value: boolean): this {
+    this._nonemptyTxnSignature = value;
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterAccounts {
+    const filters: SubscribeRequestFilterAccountsFilter[] = this._conditions.map((c) => {
+      switch (c.kind) {
+        case 'memcmp':
+          return { memcmp: memcmpToProto(c.memcmp) };
+        case 'datasize':
+          return { datasize: BigInt(c.datasize) };
+        case 'tokenAccountState':
+          return { tokenAccountState: c.state };
+        case 'lamports':
+          return { lamports: lamportsToProto(c.lamports) };
+      }
+    });
+    return {
+      account: this._account,
+      owner: this._owner,
+      filters,
+      nonemptyTxnSignature: this._nonemptyTxnSignature,
+    };
+  }
+}
+
+export class SlotFilter {
+  private _filterByCommitment?: boolean;
+  private _interslotUpdates?: boolean;
+
+  filterByCommitment(value: boolean): this {
+    this._filterByCommitment = value;
+    return this;
+  }
+
+  interslotUpdates(value: boolean): this {
+    this._interslotUpdates = value;
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterSlots {
+    return {
+      filterByCommitment: this._filterByCommitment,
+      interslotUpdates: this._interslotUpdates,
+    };
+  }
+}
+
+export class BlockFilter {
+  private _accountInclude: string[] = [];
+  private _includeTransactions?: boolean;
+  private _includeAccounts?: boolean;
+  private _includeEntries?: boolean;
+
+  accountInclude(accounts: string[]): this {
+    this._accountInclude.push(...accounts);
+    return this;
+  }
+
+  includeTransactions(value: boolean): this {
+    this._includeTransactions = value;
+    return this;
+  }
+
+  includeAccounts(value: boolean): this {
+    this._includeAccounts = value;
+    return this;
+  }
+
+  includeEntries(value: boolean): this {
+    this._includeEntries = value;
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterBlocks {
+    return {
+      accountInclude: this._accountInclude,
+      includeTransactions: this._includeTransactions,
+      includeAccounts: this._includeAccounts,
+      includeEntries: this._includeEntries,
+    };
+  }
+}
+
+export class DeshredTransactionFilter {
+  private _vote?: boolean;
+  private _accountInclude: string[] = [];
+  private _accountExclude: string[] = [];
+  private _accountRequired: string[] = [];
+
+  vote(vote: boolean): this {
+    this._vote = vote;
+    return this;
+  }
+
+  accountInclude(accounts: string[]): this {
+    this._accountInclude.push(...accounts);
+    return this;
+  }
+
+  accountExclude(accounts: string[]): this {
+    this._accountExclude.push(...accounts);
+    return this;
+  }
+
+  accountRequired(accounts: string[]): this {
+    this._accountRequired.push(...accounts);
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterDeshredTransactions {
+    return {
+      vote: this._vote,
+      accountInclude: this._accountInclude,
+      accountExclude: this._accountExclude,
+      accountRequired: this._accountRequired,
+    };
+  }
+}
+
+export class SubscribeRequestBuilder {
+  private _accounts: Record<string, AccountFilter> = {};
+  private _slots: Record<string, SlotFilter> = {};
+  private _transactions: Record<string, TransactionFilter> = {};
+  private _transactionsStatus: Record<string, TransactionFilter> = {};
+  private _blocks: Record<string, BlockFilter> = {};
+  private _blocksMeta: string[] = [];
+  private _entry: string[] = [];
+  private _commitment?: Commitment;
+  private _accountsDataSlice: { offset: number; length: number }[] = [];
+  private _fromSlot?: number;
+
+  accounts(name: string, filter: AccountFilter): this {
+    this._accounts[name] = filter;
+    return this;
+  }
+
+  slots(name: string, filter: SlotFilter): this {
+    this._slots[name] = filter;
+    return this;
+  }
+
+  transactions(name: string, filter: TransactionFilter): this {
+    this._transactions[name] = filter;
+    return this;
+  }
+
+  transactionsStatus(name: string, filter: TransactionFilter): this {
+    this._transactionsStatus[name] = filter;
+    return this;
+  }
+
+  blocks(name: string, filter: BlockFilter): this {
+    this._blocks[name] = filter;
+    return this;
+  }
+
+  blocksMeta(name: string): this {
+    this._blocksMeta.push(name);
+    return this;
+  }
+
+  entry(name: string): this {
+    this._entry.push(name);
+    return this;
+  }
+
+  commitment(commitment: Commitment): this {
+    this._commitment = commitment;
+    return this;
+  }
+
+  accountsDataSlice(offset: number, length: number): this {
+    this._accountsDataSlice.push({ offset, length });
+    return this;
+  }
+
+  fromSlot(slot: number): this {
+    this._fromSlot = slot;
+    return this;
+  }
+
+  build(): SubscribeRequest {
+    const mapValues = <T, U>(rec: Record<string, T>, fn: (v: T) => U): Record<string, U> => {
+      const out: Record<string, U> = {};
+      for (const [k, v] of Object.entries(rec)) out[k] = fn(v);
+      return out;
+    };
+    return {
+      accounts: mapValues(this._accounts, (f) => f.toProto()),
+      slots: mapValues(this._slots, (f) => f.toProto()),
+      transactions: mapValues(this._transactions, (f) => f.toProto()),
+      transactionsStatus: mapValues(this._transactionsStatus, (f) => f.toProto()),
+      blocks: mapValues(this._blocks, (f) => f.toProto()),
+      blocksMeta: Object.fromEntries(this._blocksMeta.map((k) => [k, {}])),
+      entry: Object.fromEntries(this._entry.map((k) => [k, {}])),
+      commitment: this._commitment as SubscribeRequest['commitment'],
+      accountsDataSlice: this._accountsDataSlice.map((s) => ({
+        offset: BigInt(s.offset),
+        length: BigInt(s.length),
+      })),
+      ping: { id: 1 },
+      fromSlot: this._fromSlot === undefined ? undefined : BigInt(this._fromSlot),
+    };
   }
 }

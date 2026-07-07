@@ -42,8 +42,16 @@
       "import": "./dist/grpc.js"
     },
     "./jetstream": {
-      "types": "./dist/jetstream.d.ts",
-      "import": "./dist/jetstream.js"
+      "types": "./dist/jetstream/index.d.ts",
+      "import": "./dist/jetstream/index.js"
+    },
+    "./jetstream/v2": {
+      "types": "./dist/jetstream/v2.d.ts",
+      "import": "./dist/jetstream/v2.js"
+    },
+    "./filters": {
+      "types": "./dist/filters.d.ts",
+      "import": "./dist/filters.js"
     },
     "./config": {
       "types": "./dist/config.d.ts",
@@ -60,14 +68,14 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "proto": "mkdir -p src/proto && protoc --plugin=node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/proto --ts_proto_opt=esModuleInterop=true,outputServices=grpc-js,useExactTypes=false,useOptionals=messages,importSuffix=.js -I=protos protos/jetstream.proto protos/solana-storage.proto protos/geyser.proto",
+    "proto": "mkdir -p src/proto && protoc --plugin=node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/proto --ts_proto_opt=esModuleInterop=true,outputServices=grpc-js,useExactTypes=false,useOptionals=messages,forceLong=bigint,importSuffix=.js -I=protos protos/jetstream.proto protos/jetstream_v2.proto protos/solana-storage.proto protos/geyser.proto",
     "build": "tsc -p tsconfig.build.json",
     "lint": "eslint src tests examples",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"examples/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"examples/**/*.ts\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.check.json",
     "example:rpc-basic": "tsx examples/rpc_basic.ts",
     "example:rpc-full": "tsx examples/rpc_full.ts",
     "example:ws-basic": "tsx examples/ws_basic.ts",
@@ -75,7 +83,11 @@
     "example:grpc-basic": "tsx examples/grpc_basic.ts",
     "example:grpc-full": "tsx examples/grpc_full.ts",
     "example:jetstream-basic": "tsx examples/jetstream_basic.ts",
-    "example:jetstream-full": "tsx examples/jetstream_full.ts"
+    "example:jetstream-full": "tsx examples/jetstream_full.ts",
+    "example:jetstream-filters": "tsx examples/jetstream_filters.ts",
+    "example:jetstream-v2-basic": "tsx examples/jetstream_v2_basic.ts",
+    "example:jetstream-v2-full": "tsx examples/jetstream_v2_full.ts",
+    "example:grpc-filters": "tsx examples/grpc_filters.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.0"

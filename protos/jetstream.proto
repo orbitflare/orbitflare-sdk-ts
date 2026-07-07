@@ -7,7 +7,7 @@ package jetstream;
 service Jetstream {
   // Subscribe to data streams with filtering support
   rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeUpdate) {}
-  // Subscribe to data streams with filtering support and parsed instructions
+  // Not implemented.
   rpc SubscribeParsed(stream SubscribeParsedRequest) returns (stream SubscribeUpdateParsedTransaction) {}
   // Basic ping/pong for connection testing
   rpc Ping(PingRequest) returns (PongResponse) {}
@@ -18,8 +18,8 @@ service Jetstream {
 // ============= Subscribe Request =============
 message SubscribeRequest {
   map<string, SubscribeRequestFilterTransactions> transactions = 1;
-  map<string, SubscribeRequestFilterAccounts> accounts = 2;
-  optional SubscribeRequestPing ping = 4;
+  map<string, SubscribeRequestFilterAccounts> accounts = 2;  // Not implemented.
+  SubscribeRequestPing ping = 4;
 }
 
 message SubscribeRequestFilterTransactions {
@@ -28,6 +28,7 @@ message SubscribeRequestFilterTransactions {
   repeated string account_required = 3;
 }
 
+// Not implemented.
 message SubscribeRequestFilterAccounts {
   repeated string account = 1;
   repeated string owner = 2;
@@ -70,7 +71,7 @@ message SubscribeUpdate {
   google.protobuf.Timestamp created_at = 2;
   oneof update_oneof {
     SubscribeUpdateTransaction transaction = 3;
-    SubscribeUpdateAccount account = 4;
+    SubscribeUpdateAccount account = 4;  // Not implemented.
     SubscribeUpdatePing ping = 5;
     SubscribeUpdatePong pong = 6;
   }
@@ -94,6 +95,7 @@ message SubscribeUpdateTransactionInfo {
   repeated MessageAddressTableLookup address_table_lookups = 10;
 }
 
+// Not implemented.
 message SubscribeUpdateAccount {
   SubscribeUpdateAccountInfo account = 1;
   uint64 slot = 2;
@@ -108,7 +110,7 @@ message SubscribeUpdateAccountInfo {
   uint64 rent_epoch = 5;
   bytes data = 6;
   uint64 write_version = 7;
-  optional bytes txn_signature = 8;
+  bytes txn_signature = 8;
 }
 
 message SubscribeUpdatePing {}
@@ -129,9 +131,9 @@ message CompiledInstruction {
   bytes data = 3;
 }
 
-// ============= Parsed Instruction Messages =============
+// ============= Parsed Instruction Messages (not implemented) =============
 message SubscribeParsedRequest {
-  optional SubscribeRequestPing ping = 1;
+  SubscribeRequestPing ping = 1;
 }
 
 message Instruction {
@@ -174,7 +176,6 @@ message Sell {
 
 message Withdraw {}
 
-// For SubscribeParsed RPC
 message SubscribeUpdateParsedTransaction {
   bytes signature = 1;
   uint64 slot = 2;

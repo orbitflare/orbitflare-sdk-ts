@@ -1,15 +1,23 @@
 import { type ClientDuplexStream, type ClientOptions } from '@grpc/grpc-js';
 
-import { parseAddress } from './address.js';
-import { EndpointSet } from './endpoint.js';
-import { OrbitflareError } from './error.js';
-import { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
+import { parseAddress } from '../address.js';
+import { EndpointSet } from '../endpoint.js';
+import { OrbitflareError, sanitizeUrl } from '../error.js';
+import { type Logger, type LogLevel, resolveLogger } from '../logger.js';
+import {
+  defaultRetryPolicy,
+  delayForAttempt,
+  hasAttemptsLeft,
+  type RetryPolicy,
+} from '../retry.js';
 import {
   JetstreamClient as ProtoJetstreamClient,
   type SubscribeRequest,
   type SubscribeUpdate,
-} from './proto/jetstream.js';
-import { jetstreamConfigToRequest, loadJetstreamConfig } from './config.js';
+} from '../proto/jetstream.js';
+import { jetstreamConfigToRequest, loadJetstreamConfig } from '../config.js';
+
+export { TransactionFilter, SubscribeRequestBuilder } from './filters.js';
 
 const DEFAULT_PING_INTERVAL_SECS = 10;
 const DEFAULT_MAX_MISSED_PONGS = 3;
@@ -74,6 +82,7 @@ interface JetstreamClientOptions {
   pingIntervalSecs: number;
   maxMissedPongs: number;
   channelCapacity: number;
+  logger: Logger;
 }
 
 export class JetstreamClient {
@@ -90,15 +99,27 @@ export class JetstreamClient {
       shutdownRequested = true;
     });
 
+    const { logger } = this.opts;
     void (async () => {
       let attempt = 0;
       while (!shutdownRequested) {
         attempt += 1;
         const idx = this.opts.endpoints.pick();
         const url = this.opts.endpoints.get(idx);
+        logger.info('connecting (jetstream)', { endpoint: sanitizeUrl(url), attempt });
 
         try {
-          await runConnection(url, request, stream, this.opts, () => shutdownRequested);
+          await runConnection(
+            url,
+            request,
+            stream,
+            this.opts,
+            () => shutdownRequested,
+            () => {
+              attempt = 0;
+              logger.info('connected, streaming (jetstream)');
+            },
+          );
           this.opts.endpoints.markSuccess(idx);
           return;
         } catch (e) {
@@ -108,7 +129,14 @@ export class JetstreamClient {
             stream._fail(err.withEndpoint(url));
             return;
           }
-          await sleep(delayForAttempt(this.opts.retry, attempt));
+          const delayMs = delayForAttempt(this.opts.retry, attempt);
+          logger.warn('reconnecting (jetstream)', {
+            error: err,
+            endpoint: sanitizeUrl(url),
+            attempt,
+            delayMs,
+          });
+          await sleep(delayMs);
         }
       }
     })();
@@ -123,6 +151,7 @@ async function runConnection(
   stream: JetstreamStream,
   opts: JetstreamClientOptions,
   shouldShutdown: () => boolean,
+  onConnected: () => void,
 ): Promise<void> {
   const { target, credentials } = parseAddress(url);
   const clientOpts: Partial<ClientOptions> = {
@@ -142,6 +171,7 @@ async function runConnection(
 
   let missedPongs = 0;
   let pingId = 1;
+  let connected = false;
   let pingTimer: NodeJS.Timeout | undefined;
   let resolveDone: () => void;
   let rejectDone: (err: OrbitflareError) => void;
@@ -159,6 +189,10 @@ async function runConnection(
   };
 
   call.on('data', (update: SubscribeUpdate) => {
+    if (!connected) {
+      connected = true;
+      onConnected();
+    }
     if (update.pong) {
       missedPongs = 0;
       return;
@@ -224,9 +258,21 @@ export class JetstreamClientBuilder {
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
   private _channelCapacity = 4096;
+  private _logger?: Logger;
+  private _logLevel?: LogLevel;
 
   url(url: string): this {
     this._url = url;
+    return this;
+  }
+
+  logger(logger: Logger): this {
+    this._logger = logger;
+    return this;
+  }
+
+  logLevel(level: LogLevel): this {
+    this._logLevel = level;
     return this;
   }
 
@@ -293,6 +339,7 @@ export class JetstreamClientBuilder {
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
       channelCapacity: this._channelCapacity,
+      logger: resolveLogger(this._logger, this._logLevel),
     });
   }
 }

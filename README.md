@@ -100,6 +100,48 @@ for await (const update of stream) {
 
 The YAML format supports `${ENV_VAR}` expansion. You can also call `client.subscribe(request)` with a programmatically constructed `SubscribeRequest`.
 
+### Typed filters
+
+Build the request programmatically with the typed builder instead of YAML:
+
+```ts
+import {
+  AccountFilter,
+  Commitment,
+  GeyserClientBuilder,
+  Lamports,
+  Memcmp,
+  SlotFilter,
+  SubscribeRequestBuilder,
+  TransactionFilter,
+} from '@orbitflare/sdk/grpc';
+
+const request = new SubscribeRequestBuilder()
+  .transactions(
+    'pumpfun',
+    new TransactionFilter()
+      .vote(false)
+      .failed(false)
+      .accountInclude(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'])
+      .accountRequired(['So11111111111111111111111111111111111111112']),
+  )
+  .accounts(
+    'wsol-token-accounts',
+    new AccountFilter()
+      .owner(['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'])
+      .datasize(165)
+      .memcmp(Memcmp.base58(0, 'So11111111111111111111111111111111111111112'))
+      .lamports(Lamports.gt(0)),
+  )
+  .slots('slots', new SlotFilter().filterByCommitment(true))
+  .commitment(Commitment.Confirmed)
+  .build();
+
+const stream = client.subscribe(request);
+```
+
+`client.subscribe(request)` also accepts a raw `SubscribeRequest` if you'd rather construct it by hand.
+
 ## JetStream
 
 ```yaml
@@ -123,6 +165,80 @@ for await (const update of stream) {
   if (update.transaction) {
     console.log(`slot=${update.transaction.slot}`);
   }
+}
+```
+
+Or build the request with the typed builder:
+
+```ts
+import {
+  JetstreamClientBuilder,
+  SubscribeRequestBuilder,
+  TransactionFilter,
+} from '@orbitflare/sdk/jetstream';
+
+const request = new SubscribeRequestBuilder()
+  .transactions(
+    'pumpfun',
+    new TransactionFilter()
+      .accountInclude(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'])
+      .accountRequired(['So11111111111111111111111111111111111111112']),
+  )
+  .build();
+
+const stream = client.subscribe(request);
+```
+
+### JetStream v2
+
+v2 (`@orbitflare/sdk/jetstream/v2`) runs on the same endpoint and auth as v1 and is fully additive. Filters are managed at runtime over a bidirectional stream (no reconnect to change them), every response carries a monotonic `sequence` for gap detection, slot lifecycle events are a separate stream, and transactions can opt into enrichment (fee payer, program ids, compute-unit price, loaded address-table addresses, and more).
+
+```ts
+import { JetstreamClientBuilder, TransactionFilter } from '@orbitflare/sdk/jetstream/v2';
+
+const client = new JetstreamClientBuilder()
+  .url('http://slc.jetstream.orbitflare.com')
+  .fallbackUrl('http://ams.jetstream.orbitflare.com')
+  .build();
+
+console.log(`version=${await client.getVersion()}`);
+
+const filter = new TransactionFilter()
+  .accountInclude(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'])
+  .includeEnrichment(true)
+  .withId('pumpfun');
+
+const stream = client.subscribeTransactions([filter]);
+
+for await (const resp of stream) {
+  if (resp.transaction) {
+    const tx = resp.transaction.transaction;
+    if (tx) {
+      console.log(`seq=${resp.sequence} slot=${tx.slot} cuPrice=${tx.computeUnitPrice}`);
+    }
+  } else if (resp.filterValidation) {
+    console.log(`filter ${resp.filterValidation.filterId} accepted=${resp.filterValidation.accepted}`);
+  }
+}
+```
+
+Add or remove filters on a live stream without reconnecting:
+
+```ts
+const handle = stream.handle();
+handle.addFilters([
+  new TransactionFilter().accountInclude(['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8']).withId('raydium'),
+]);
+handle.removeFilters(['pumpfun']);
+```
+
+Slot lifecycle events are a separate server stream:
+
+```ts
+const slots = client.subscribeSlots();
+
+for await (const event of slots) {
+  console.log(`slot=${event.slot} status=${event.status}`);
 }
 ```
 
@@ -223,6 +339,10 @@ npm run example:ws-basic
 npm run example:ws-full
 npm run example:grpc-basic
 npm run example:grpc-full
+npm run example:grpc-filters
 npm run example:jetstream-basic
 npm run example:jetstream-full
+npm run example:jetstream-filters
+npm run example:jetstream-v2-basic
+npm run example:jetstream-v2-full
 ```

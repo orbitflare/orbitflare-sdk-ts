@@ -1,6 +1,7 @@
 import { applyApiKey } from './credentials.js';
 import { EndpointSet } from './endpoint.js';
 import { OrbitflareError, sanitizeUrl } from './error.js';
+import { type Logger, type LogLevel, resolveLogger } from './logger.js';
 import { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -44,6 +45,7 @@ export class RpcClient {
   private readonly _commitment: string;
   private readonly retry: RetryPolicy;
   private readonly timeoutMs: number;
+  private readonly logger: Logger;
 
   constructor(opts: {
     endpoints: EndpointSet;
@@ -51,12 +53,14 @@ export class RpcClient {
     commitment: string;
     retry: RetryPolicy;
     timeoutMs: number;
+    logger: Logger;
   }) {
     this.endpoints = opts.endpoints;
     this.apiKey = opts.apiKey;
     this._commitment = opts.commitment;
     this.retry = opts.retry;
     this.timeoutMs = opts.timeoutMs;
+    this.logger = opts.logger;
   }
 
   commitment(): string {
@@ -205,7 +209,7 @@ export class RpcClient {
     return this.apiKey ?? process.env.ORBITFLARE_LICENSE_KEY ?? undefined;
   }
 
-  private async execute<T>(body: unknown, _method: string): Promise<T> {
+  private async execute<T>(body: unknown, method: string): Promise<T> {
     let lastErr: OrbitflareError | undefined;
     let tried = 0;
 
@@ -226,12 +230,14 @@ export class RpcClient {
           const retryable = err.isRetryable();
 
           if (retryable && hasAttemptsLeft(this.retry, attempt)) {
-            const delay = err.retryAfter() ?? delayForAttempt(this.retry, attempt);
-            await sleep(delay);
+            const delayMs = err.retryAfter() ?? delayForAttempt(this.retry, attempt);
+            this.logger.warn('retrying', { method, attempt, delayMs, error: err });
+            await sleep(delayMs);
             continue;
           }
 
           this.endpoints.markFailure(idx);
+          this.logger.warn('failing over', { method, endpoint: sanitizeUrl(url), error: err });
           lastErr = err.withEndpoint(url);
           break;
         }
@@ -315,9 +321,21 @@ export class RpcClientBuilder {
   private _commitment = 'confirmed';
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _timeoutMs = 30_000;
+  private _logger?: Logger;
+  private _logLevel?: LogLevel;
 
   url(url: string): this {
     this._url = url;
+    return this;
+  }
+
+  logger(logger: Logger): this {
+    this._logger = logger;
+    return this;
+  }
+
+  logLevel(level: LogLevel): this {
+    this._logLevel = level;
     return this;
   }
 
@@ -373,6 +391,7 @@ export class RpcClientBuilder {
       commitment: this._commitment,
       retry: this._retry,
       timeoutMs: this._timeoutMs,
+      logger: resolveLogger(this._logger, this._logLevel),
     });
   }
 }

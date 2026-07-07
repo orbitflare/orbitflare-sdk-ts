@@ -2,7 +2,8 @@ import WebSocket from 'ws';
 
 import { applyApiKey } from './credentials.js';
 import { EndpointSet } from './endpoint.js';
-import { OrbitflareError } from './error.js';
+import { OrbitflareError, sanitizeUrl } from './error.js';
+import { type Logger, type LogLevel, resolveLogger } from './logger.js';
 import { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
 
 const DEFAULT_PING_INTERVAL_SECS = 10;
@@ -102,9 +103,21 @@ export class WsClientBuilder {
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
+  private _logger?: Logger;
+  private _logLevel?: LogLevel;
 
   url(url: string): this {
     this._url = url;
+    return this;
+  }
+
+  logger(logger: Logger): this {
+    this._logger = logger;
+    return this;
+  }
+
+  logLevel(level: LogLevel): this {
+    this._logLevel = level;
     return this;
   }
 
@@ -164,6 +177,7 @@ export class WsClientBuilder {
       retry: this._retry,
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
+      logger: resolveLogger(this._logger, this._logLevel),
     });
     await client._start();
     return client;
@@ -186,16 +200,20 @@ export class WsClient {
   private shutdownRequested = false;
   private reconnectAttempt = 0;
 
+  private readonly logger: Logger;
+
   constructor(opts: {
     endpoints: EndpointSet;
     retry: RetryPolicy;
     pingIntervalSecs: number;
     maxMissedPongs: number;
+    logger: Logger;
   }) {
     this.endpoints = opts.endpoints;
     this.retry = opts.retry;
     this.pingIntervalMs = opts.pingIntervalSecs * 1000;
     this.maxMissedPongs = opts.maxMissedPongs;
+    this.logger = opts.logger;
   }
 
   async _start(): Promise<void> {
@@ -213,9 +231,14 @@ export class WsClient {
         this.startPingTimer();
         this.replaySubscriptions();
         this.reconnectAttempt = 0;
+        this.logger.info('ws connected', { endpoint: sanitizeUrl(url) });
         return;
-      } catch {
+      } catch (e) {
         this.endpoints.markFailure(i);
+        this.logger.warn('ws connect failed', {
+          endpoint: sanitizeUrl(url),
+          error: e instanceof Error ? e : String(e),
+        });
       }
     }
     throw OrbitflareError.transport(new Error('all ws endpoints failed'));
@@ -238,6 +261,7 @@ export class WsClient {
     ws.on('close', () => {
       if (this.shutdownRequested) return;
       this.endpoints.markFailure(endpointIdx);
+      this.logger.warn('ws connection lost');
       void this.scheduleReconnect();
     });
     ws.on('error', () => {});
@@ -273,14 +297,19 @@ export class WsClient {
     while (!this.shutdownRequested) {
       this.reconnectAttempt += 1;
       if (!hasAttemptsLeft(this.retry, this.reconnectAttempt)) {
+        this.logger.error('ws reconnect attempts exhausted', { attempt: this.reconnectAttempt });
         for (const sub of this.subscriptions.values()) sub._close();
         return;
       }
-      await sleep(delayForAttempt(this.retry, this.reconnectAttempt));
+      const delayMs = delayForAttempt(this.retry, this.reconnectAttempt);
+      this.logger.warn('reconnecting (ws)', { attempt: this.reconnectAttempt, delayMs });
+      await sleep(delayMs);
       try {
         await this.connect();
         return;
-      } catch {}
+      } catch (e) {
+        this.logger.warn('ws reconnect failed', { error: e instanceof Error ? e : String(e) });
+      }
     }
   }
 
