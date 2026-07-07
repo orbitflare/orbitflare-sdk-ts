@@ -2,7 +2,13 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "."
+    "rootDir": ".",
+    "paths": {
+      "@orbitflare/sdk": ["./src/index.ts"],
+      "@orbitflare/sdk/jetstream": ["./src/jetstream/index.ts"],
+      "@orbitflare/sdk/jetstream/v2": ["./src/jetstream/v2.ts"],
+      "@orbitflare/sdk/*": ["./src/*.ts"]
+    }
   },
   "include": ["src/**/*", "tests/**/*", "examples/**/*"],
   "exclude": ["dist", "node_modules"]

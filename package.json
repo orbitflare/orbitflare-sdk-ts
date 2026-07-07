@@ -1,6 +1,6 @@
 {
   "name": "@orbitflare/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for OrbitFlare - RPC, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
   "license": "MIT",
   "author": "OrbitFlare",
