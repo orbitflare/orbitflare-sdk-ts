@@ -148,6 +148,29 @@ message TransactionMessage {
   // getMultipleAccounts). Default false = fully resolved. Emitted only under
   // enrichment (same gate as fields 14-21).
   bool alt_resolution_incomplete = 22;
+
+  // SIMD-0385 Transaction V1 config, carried in the message body. PRESENT ONLY
+  // FOR V1 (absent for legacy and V0); its presence is how you identify a V1
+  // transaction. Always sent (not enrichment-gated) — it is intrinsic tx data.
+  // version test: config present -> v1; else versioned -> v0; else legacy.
+  optional TransactionConfig config = 23;
+
+  // Priority fee in TOTAL LAMPORTS, populated for ALL versions so they can be
+  // ranked against one another. Use this, not compute_unit_price (17), to sort
+  // by fee — field 17 is absent for every V1 tx. For v1 this is
+  // config.priority_fee; for legacy/v0 it is derived from the ComputeBudget
+  // instructions. Emitted only under enrichment.
+  optional uint64 priority_fee_lamports = 24;
+}
+
+// Transaction-level configuration carried by V1 messages (SIMD-0385). Replaces
+// the ComputeBudget instructions used by legacy/V0. Explicit presence: an absent
+// field means the sender requested nothing, which is NOT the same as zero.
+message TransactionConfig {
+  optional uint64 priority_fee = 1;                     // TOTAL lamports, not per-CU. Absent = 0.
+  optional uint32 compute_unit_limit = 2;              // Absent = 0 requested.
+  optional uint32 loaded_accounts_data_size_limit = 3; // Bytes. Absent = 0 (legacy/V0 default is 64 MiB).
+  optional uint32 heap_size = 4;                        // Bytes, multiple of 1024 in [32768, 262144]. Absent = 32 KiB default.
 }
 
 message CompiledInstruction {

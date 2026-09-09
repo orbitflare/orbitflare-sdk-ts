@@ -129,7 +129,7 @@ export class RpcClient {
       {
         encoding: 'json',
         commitment: this._commitment,
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
       },
     ]);
   }
