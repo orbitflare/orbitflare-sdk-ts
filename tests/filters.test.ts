@@ -84,7 +84,8 @@ describe('gRPC SubscribeRequestBuilder', () => {
     expect(req.commitment).toBe(Commitment.Confirmed);
     expect(req.accountsDataSlice).toEqual([{ offset: 0n, length: 32n }]);
     expect(req.fromSlot).toBe(100n);
-    expect(req.ping).toEqual({ id: 1 });
+    // Vanilla Yellowstone ignores the filters of a request that carries a ping.
+    expect(req.ping).toBeUndefined();
   });
 
   it('builds a DeshredTransactionFilter', () => {

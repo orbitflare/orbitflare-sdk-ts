@@ -142,7 +142,9 @@ export function geyserConfigToRequest(cfg: GeyserStreamConfig): GeyserSubscribeR
     entry: {},
     commitment: parseCommitment(cfg.commitment),
     accountsDataSlice: [],
-    ping: { id: 1 },
+    // No ping here: vanilla Yellowstone answers a request that carries a ping with a pong
+    // and ignores its filters, so the subscription would never start.
+    ping: undefined,
     fromSlot: undefined,
   } as GeyserSubscribeRequest;
 }
