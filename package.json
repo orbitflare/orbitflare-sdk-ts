@@ -1,7 +1,7 @@
 {
   "name": "@orbitflare/sdk",
   "version": "0.3.1",
-  "description": "TypeScript SDK for OrbitFlare - RPC, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
+  "description": "TypeScript SDK for OrbitFlare - RPC, Apex transaction landing, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
   "license": "MIT",
   "author": "OrbitFlare",
   "homepage": "https://orbitflare.com",
@@ -12,6 +12,7 @@
   "keywords": [
     "solana",
     "grpc",
+    "apex",
     "rpc",
     "orbitflare",
     "yellowstone",
@@ -32,6 +33,10 @@
     "./rpc": {
       "types": "./dist/rpc.d.ts",
       "import": "./dist/rpc.js"
+    },
+    "./apex": {
+      "types": "./dist/apex.d.ts",
+      "import": "./dist/apex.js"
     },
     "./ws": {
       "types": "./dist/ws.d.ts",
@@ -78,6 +83,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.check.json",
     "example:rpc-basic": "tsx examples/rpc_basic.ts",
     "example:rpc-full": "tsx examples/rpc_full.ts",
+    "example:apex-basic": "tsx examples/apex_basic.ts",
+    "example:apex-full": "tsx examples/apex_full.ts",
     "example:ws-basic": "tsx examples/ws_basic.ts",
     "example:ws-full": "tsx examples/ws_full.ts",
     "example:grpc-basic": "tsx examples/grpc_basic.ts",
@@ -110,6 +117,9 @@
   },
   "devDependencies": {
     "@grpc/grpc-js": "^1.14.0",
+    "@solana-program/compute-budget": "^0.19.0",
+    "@solana-program/system": "^0.15.0",
+    "@solana/kit": "^8.4.0",
     "@types/node": "^25.0.0",
     "@types/ws": "^8.18.0",
     "@typescript-eslint/eslint-plugin": "^8.59.0",

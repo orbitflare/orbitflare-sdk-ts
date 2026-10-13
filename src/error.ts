@@ -7,7 +7,8 @@ export type ErrorKind =
   | 'timeout'
   | 'stream'
   | 'config'
-  | 'serialization';
+  | 'serialization'
+  | 'apex';
 
 export interface RpcErrorPayload {
   code: number;
@@ -19,10 +20,17 @@ export interface GrpcErrorPayload {
   message: string;
 }
 
+export interface ApexErrorPayload {
+  status: number;
+  label: string;
+  message: string;
+}
+
 export class OrbitflareError extends Error {
   readonly kind: ErrorKind;
   readonly rpc?: RpcErrorPayload;
   readonly grpc?: GrpcErrorPayload;
+  readonly apex?: ApexErrorPayload;
   readonly retryAfterMs?: number;
   readonly cause?: unknown;
 
@@ -32,6 +40,7 @@ export class OrbitflareError extends Error {
     extra: {
       rpc?: RpcErrorPayload;
       grpc?: GrpcErrorPayload;
+      apex?: ApexErrorPayload;
       retryAfterMs?: number;
       cause?: unknown;
     } = {},
@@ -41,6 +50,7 @@ export class OrbitflareError extends Error {
     this.kind = kind;
     if (extra.rpc) this.rpc = extra.rpc;
     if (extra.grpc) this.grpc = extra.grpc;
+    if (extra.apex) this.apex = extra.apex;
     if (extra.retryAfterMs !== undefined) this.retryAfterMs = extra.retryAfterMs;
     if (extra.cause !== undefined) this.cause = extra.cause;
   }
@@ -59,6 +69,12 @@ export class OrbitflareError extends Error {
   static grpc(code: number, message: string): OrbitflareError {
     return new OrbitflareError('grpc', `grpc error (${code}): ${message}`, {
       grpc: { code, message },
+    });
+  }
+
+  static apex(status: number, label: string, message: string): OrbitflareError {
+    return new OrbitflareError('apex', `apex rejected (${status} ${label}): ${message}`, {
+      apex: { status, label, message },
     });
   }
 
@@ -132,6 +148,13 @@ export class OrbitflareError extends Error {
             grpc: { code: this.grpc.code, message: `[${sanitized}] ${this.grpc.message}` },
           },
         );
+      case 'apex':
+        if (!this.apex) return this;
+        return new OrbitflareError(
+          'apex',
+          `apex rejected (${this.apex.status} ${this.apex.label}): [${sanitized}] ${this.apex.message}`,
+          { apex: this.apex },
+        );
       default:
         return this;
     }
@@ -140,7 +163,7 @@ export class OrbitflareError extends Error {
 
 export function sanitizeUrl(url: string): string {
   let result = url;
-  for (const needle of ['?api_key=', '&api_key=']) {
+  for (const needle of ['?api_key=', '&api_key=', '?api-key=', '&api-key=']) {
     let start = result.indexOf(needle);
     while (start !== -1) {
       const valueStart = start + needle.length;

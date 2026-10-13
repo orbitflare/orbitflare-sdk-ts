@@ -9,7 +9,7 @@
 
 # @orbitflare/sdk
 
-TypeScript SDK for [OrbitFlare](https://orbitflare.com) - RPC, gRPC (Yellowstone Geyser), JetStream, and WebSocket clients for Solana.
+TypeScript SDK for [OrbitFlare](https://orbitflare.com) - RPC, Apex transaction landing, gRPC (Yellowstone Geyser), JetStream, and WebSocket clients for Solana.
 
 ## Install
 
@@ -65,6 +65,85 @@ const raw = await client.requestRaw(
 | `getTransactionsForAddress(address, options)` | Full transaction history with filters and pagination (OrbitFlare-specific) |
 | `request(method, params)` | Any RPC method by name |
 | `requestRaw(body)` | Raw JSON-RPC body string |
+
+## Apex
+
+[Apex](https://apex.orbitflare.com) is OrbitFlare's transaction landing service. You send a signed transaction to the endpoint nearest you, and Apex races it to the upcoming leader over staked validator clients, Jito bundles and the leader TPUs at once. `ApexClient` covers Apex's HTTP routes: JSON-RPC `sendTransaction`, the binary `/send-bin` route, batches, bundles and `getTipAccounts`.
+
+```ts
+import { ApexClientBuilder, RpcClientBuilder, pickApexTipAccount, waitForConfirmation } from '@orbitflare/sdk';
+
+const apex = new ApexClientBuilder()
+  .region('fra')
+  .fallbackRegion('ams')
+  .apiKey(process.env.ORBITFLARE_APEX_API_KEY!)
+  .build();
+
+const tipAccount = pickApexTipAccount(await apex.getTipAccounts());
+
+const signature = await apex.sendTransactionBinary(signedTransactionBytes);
+
+const solana = new RpcClientBuilder().url('http://fra.rpc.orbitflare.com').build();
+const slot = await waitForConfirmation(solana, signature);
+```
+
+The client takes signed wire bytes (`Uint8Array`, `Buffer`, or the bytes from `getTransactionEncoder().encode()` in `@solana/kit`), so it works with any Solana library. Legacy, v0 and v1 transactions are all accepted, v1 up to 4096 bytes.
+
+### Tips
+
+Every transaction carries exactly one top-level SystemProgram transfer to one of the published tip accounts, at or above your key's floor (`APEX_MIN_TIP_LAMPORTS`, 0.001 SOL on the standard tier), with the tip account as a static account key rather than through a lookup table. The tip is only paid when the transaction lands. With `@solana/kit`:
+
+```ts
+import { address, lamports } from '@solana/kit';
+import { getTransferSolInstruction } from '@solana-program/system';
+import { APEX_MIN_TIP_LAMPORTS } from '@orbitflare/sdk';
+
+const tip = getTransferSolInstruction({
+  source: payer,
+  destination: address(tipAccount),
+  amount: lamports(BigInt(APEX_MIN_TIP_LAMPORTS)),
+});
+```
+
+With `@solana/web3.js`, the same tip is `SystemProgram.transfer({ fromPubkey, toPubkey: new PublicKey(tipAccount), lamports: APEX_MIN_TIP_LAMPORTS })`.
+
+### Methods
+
+| Method | Returns |
+|---|---|
+| `sendTransactionBinary(tx, opts?)` | Signature. Raw bytes to `/send-bin`, the cheapest HTTP path |
+| `sendTransaction(tx, opts?)` | Signature. JSON-RPC `sendTransaction`, base64 in JSON |
+| `sendBatch(txs, opts?)` | `{ attempted, accepted, rejected, results }` for up to 16 transactions |
+| `sendBundle(txs)` | `{ bundleId, signatures }` for 1 to 4 transactions that land in order, all or nothing |
+| `getBundleStatuses(bundleIds)` | `Pending`, `Landed` with the slot, `Failed` or `Invalid` per bundle |
+| `getTipAccounts()` | The tip accounts this endpoint accepts |
+| `ping()` | Resolves once the endpoint answers, and keeps the connection warm |
+
+`opts` takes `mevProtect` (skip leaders on OrbitFlare's Shield blocklist) and `maxRetries` (the retry budget handed to validator clients). Both can also be set once on the builder with `.mevProtect(true)` and `.maxRetries(n)`.
+
+Helpers: `apexClientPubkey(apiKey)` returns the public key your Apex key derives to, which should match the one shown next to the key on your dashboard. `waitForConfirmation(rpc, signature)` polls any Solana RPC until the transaction is confirmed. `fetchApexVaults(rpc)` lists the tip program's vaults on chain, for verifying a published account.
+
+### Regions
+
+`fra`, `ams`, `dub`, `lon`, `nyc`, `slc`, `sgp`, `tyo`, `sqq`, or `global` for the nearest endpoint. `.region()` picks one, `.fallbackRegion()` adds failover targets, and `.url()` takes a full URL. Without either, the builder reads `ORBITFLARE_APEX_URL` or `ORBITFLARE_APEX_REGION` and defaults to `fra`.
+
+### Errors and retries
+
+A rejection from Apex is an `OrbitflareError` with kind `apex`, carrying the HTTP status, Apex's label (`unauthorized`, `below_floor`, `no_tip`, `malformed`, `busy`) and its message. JSON-RPC rejections keep kind `rpc` with the JSON-RPC code. Rejections are returned straight away and never retried or failed over, since every endpoint would give the same answer. Unreachable endpoints, timeouts and 429s fail over to the next endpoint. By default a send is not retried on the same endpoint; pass `.retry()` to change that.
+
+```ts
+try {
+  await apex.sendTransactionBinary(tx);
+} catch (e) {
+  if (e instanceof OrbitflareError && e.kind === 'apex') {
+    console.log(e.apex?.label, e.apex?.message);
+  }
+}
+```
+
+A returned signature means Apex accepted the transaction and is racing it to the leaders. It does not mean it landed: confirm with `waitForConfirmation` or `getSignatureStatuses`.
+
+Apex's HTTP routes are plain HTTP, so the key and transactions are readable on the network path. Send from a network you trust, or use the QUIC transport in the Rust ([`orbitflare-apex`](https://crates.io/crates/orbitflare-apex)) or Go ([`orbitflare-apex-go`](https://github.com/orbitflare/orbitflare-apex-go)) clients, where the key never leaves your machine. Node has no stable QUIC support yet, so this SDK uses HTTP.
 
 ## gRPC (Yellowstone Geyser)
 
@@ -316,13 +395,16 @@ const client = new RpcClientBuilder()
 |---|---|---|
 | `ORBITFLARE_LICENSE_KEY` | RPC, WebSocket | API key appended to endpoint URLs |
 | `ORBITFLARE_RPC_URL` | RPC | Default endpoint if `.url()` is not called |
+| `ORBITFLARE_APEX_API_KEY` | Apex | Apex API key, a separate credential from the license key |
+| `ORBITFLARE_APEX_URL` | Apex | Default endpoint if `.url()` and `.region()` are not called |
+| `ORBITFLARE_APEX_REGION` | Apex | Default region code if no URL is set |
 | `ORBITFLARE_WS_URL` | WebSocket | Default endpoint if `.url()` is not called |
 | `ORBITFLARE_GRPC_URL` | gRPC | Default endpoint if `.url()` is not called |
 | `ORBITFLARE_JETSTREAM_URL` | JetStream | Default endpoint if `.url()` is not called |
 
 ## Examples
 
-Eight runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
+Fourteen runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
 
 ```bash
 git clone https://github.com/orbitflare/orbitflare-sdk-ts.git
@@ -335,6 +417,8 @@ export ORBITFLARE_LICENSE_KEY=ORBIT-...
 
 npm run example:rpc-basic
 npm run example:rpc-full
+npm run example:apex-basic
+npm run example:apex-full
 npm run example:ws-basic
 npm run example:ws-full
 npm run example:grpc-basic
@@ -346,3 +430,5 @@ npm run example:jetstream-filters
 npm run example:jetstream-v2-basic
 npm run example:jetstream-v2-full
 ```
+
+The Apex examples send real tipped transfers on mainnet. They read `ORBITFLARE_APEX_API_KEY`, `KEYPAIR_PATH` (a Solana CLI keypair file, default `payer.json`), `SOLANA_RPC_URL`, and optionally `TO` (default: the payer itself), `LAMPORTS` (default 1000) and `ORBITFLARE_APEX_REGION`. `apex-full` sends a legacy transaction over `/send-bin`, a v1 transaction over JSON-RPC and a batch of two, then shows a below-floor tip being refused. Each landed transfer costs the 0.001 SOL tip plus fees.
