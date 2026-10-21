@@ -1,4 +1,4 @@
-import { ChannelCredentials } from '@grpc/grpc-js';
+import { ChannelCredentials, InterceptingCall, type Interceptor } from '@grpc/grpc-js';
 
 export interface ParsedAddress {
   target: string;
@@ -11,4 +11,17 @@ export function parseAddress(url: string): ParsedAddress {
   const credentials =
     u.protocol === 'https:' ? ChannelCredentials.createSsl() : ChannelCredentials.createInsecure();
   return { target: `${u.hostname}:${port}`, credentials };
+}
+
+export function apiKeyInterceptors(apiKey: string | undefined): Interceptor[] {
+  if (!apiKey) return [];
+  return [
+    (options, nextCall) =>
+      new InterceptingCall(nextCall(options), {
+        start(metadata, listener, next) {
+          metadata.set('x-token', apiKey);
+          next(metadata, listener);
+        },
+      }),
+  ];
 }

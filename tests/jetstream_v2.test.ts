@@ -76,3 +76,51 @@ describe('v2 JetstreamClientBuilder', () => {
     stream.close();
   });
 });
+
+describe('v2 api key', () => {
+  async function versionServer(seen: (string | undefined)[]) {
+    const grpc = await import('@grpc/grpc-js');
+    const { JetstreamV2Service } = await import('../src/proto/jetstream_v2.js');
+    const server = new grpc.Server();
+    server.addService(JetstreamV2Service, {
+      getVersion: (
+        call: { metadata: { get(k: string): unknown[] } },
+        cb: (e: null, r: { version: string }) => void,
+      ) => {
+        seen.push(call.metadata.get('x-token')[0] as string | undefined);
+        cb(null, { version: 'test' });
+      },
+    } as never);
+    const port = await new Promise<number>((resolve, reject) =>
+      server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (e, p) =>
+        e ? reject(e) : resolve(p),
+      ),
+    );
+    return { server, url: `http://127.0.0.1:${port}` };
+  }
+
+  it('sends the key as x-token', async () => {
+    const seen: (string | undefined)[] = [];
+    const { server, url } = await versionServer(seen);
+    try {
+      await new JetstreamClientBuilder().url(url).apiKey('ORBIT-123').build().getVersion();
+      expect(seen).toEqual(['ORBIT-123']);
+    } finally {
+      server.forceShutdown();
+    }
+  });
+
+  it('sends no x-token without a key', async () => {
+    const saved = process.env.ORBITFLARE_LICENSE_KEY;
+    delete process.env.ORBITFLARE_LICENSE_KEY;
+    const seen: (string | undefined)[] = [];
+    const { server, url } = await versionServer(seen);
+    try {
+      await new JetstreamClientBuilder().url(url).build().getVersion();
+      expect(seen).toEqual([undefined]);
+    } finally {
+      server.forceShutdown();
+      if (saved !== undefined) process.env.ORBITFLARE_LICENSE_KEY = saved;
+    }
+  });
+});

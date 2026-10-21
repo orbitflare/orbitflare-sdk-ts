@@ -1,6 +1,6 @@
 import { type ClientDuplexStream, type ClientOptions } from '@grpc/grpc-js';
 
-import { parseAddress } from './address.js';
+import { apiKeyInterceptors, parseAddress } from './address.js';
 import { EndpointSet } from './endpoint.js';
 import { OrbitflareError, sanitizeUrl } from './error.js';
 import { type Logger, type LogLevel, resolveLogger } from './logger.js';
@@ -79,6 +79,7 @@ export class GeyserStream {
 
 interface GeyserClientOptions {
   endpoints: EndpointSet;
+  apiKey?: string;
   retry: RetryPolicy;
   timeoutSecs: number;
   keepaliveSecs: number;
@@ -158,6 +159,7 @@ async function runConnection(
 ): Promise<void> {
   const { target, credentials } = parseAddress(url);
   const clientOpts: Partial<ClientOptions> = {
+    interceptors: apiKeyInterceptors(opts.apiKey),
     'grpc.keepalive_time_ms': opts.keepaliveSecs * 1000,
     'grpc.keepalive_timeout_ms': opts.timeoutSecs * 1000,
     'grpc.keepalive_permit_without_calls': 1,
@@ -263,6 +265,7 @@ function toGrpcError(e: any): OrbitflareError {
 export class GeyserClientBuilder {
   private _url?: string;
   private _fallbacks: string[] = [];
+  private _apiKey?: string;
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _timeoutSecs = 30;
   private _keepaliveSecs = 60;
@@ -305,6 +308,11 @@ export class GeyserClientBuilder {
     return this;
   }
 
+  apiKey(key: string): this {
+    this._apiKey = key;
+    return this;
+  }
+
   retry(policy: RetryPolicy): this {
     this._retry = policy;
     return this;
@@ -344,6 +352,7 @@ export class GeyserClientBuilder {
     }
     return new GeyserClient({
       endpoints: new EndpointSet(url, this._fallbacks),
+      apiKey: this._apiKey ?? process.env.ORBITFLARE_LICENSE_KEY,
       retry: this._retry,
       timeoutSecs: this._timeoutSecs,
       keepaliveSecs: this._keepaliveSecs,
