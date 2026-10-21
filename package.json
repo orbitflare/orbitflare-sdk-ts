@@ -1,7 +1,7 @@
 {
   "name": "@orbitflare/sdk",
-  "version": "0.4.0",
-  "description": "TypeScript SDK for OrbitFlare - RPC, Apex transaction landing, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
+  "version": "0.5.0",
+  "description": "TypeScript SDK for OrbitFlare - RPC, DAS, Apex transaction landing, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
   "license": "MIT",
   "author": "OrbitFlare",
   "homepage": "https://orbitflare.com",
@@ -33,6 +33,10 @@
     "./rpc": {
       "types": "./dist/rpc.d.ts",
       "import": "./dist/rpc.js"
+    },
+    "./das": {
+      "types": "./dist/das.d.ts",
+      "import": "./dist/das.js"
     },
     "./apex": {
       "types": "./dist/apex.d.ts",
@@ -83,6 +87,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.check.json",
     "example:rpc-basic": "tsx examples/rpc_basic.ts",
     "example:rpc-full": "tsx examples/rpc_full.ts",
+    "example:das": "tsx examples/das.ts",
     "example:apex-basic": "tsx examples/apex_basic.ts",
     "example:apex-full": "tsx examples/apex_full.ts",
     "example:ws-basic": "tsx examples/ws_basic.ts",
