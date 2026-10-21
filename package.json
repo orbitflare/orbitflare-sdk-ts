@@ -122,10 +122,10 @@
   },
   "devDependencies": {
     "@grpc/grpc-js": "^1.14.0",
-    "@solana-program/compute-budget": "^0.19.0",
-    "@solana-program/system": "^0.15.0",
+    "@solana-program/compute-budget": "^0.20.0",
+    "@solana-program/system": "^0.16.0",
     "@solana/kit": "^8.4.0",
-    "@types/node": "^25.0.0",
+    "@types/node": "^26.0.0",
     "@types/ws": "^8.18.0",
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",

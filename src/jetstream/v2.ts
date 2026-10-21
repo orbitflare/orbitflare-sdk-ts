@@ -161,8 +161,7 @@ export class TransactionStream {
 
   _setCall(
     call:
-      | ClientDuplexStream<SubscribeTransactionsRequest, SubscribeTransactionsResponse>
-      | undefined,
+      ClientDuplexStream<SubscribeTransactionsRequest, SubscribeTransactionsResponse> | undefined,
   ): void {
     this.call = call;
   }

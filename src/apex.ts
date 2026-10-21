@@ -9,16 +9,7 @@ import type { RpcClient } from './rpc.js';
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export type ApexRegion =
-  | 'fra'
-  | 'ams'
-  | 'dub'
-  | 'lon'
-  | 'nyc'
-  | 'slc'
-  | 'sgp'
-  | 'tyo'
-  | 'sqq'
-  | 'global';
+  'fra' | 'ams' | 'dub' | 'lon' | 'nyc' | 'slc' | 'sgp' | 'tyo' | 'sqq' | 'global';
 
 export const APEX_REGIONS: readonly ApexRegion[] = [
   'fra',
