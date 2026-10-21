@@ -66,6 +66,56 @@ const raw = await client.requestRaw(
 | `request(method, params)` | Any RPC method by name |
 | `requestRaw(body)` | Raw JSON-RPC body string |
 
+## DAS API
+
+The Digital Asset Standard methods read NFTs, compressed NFTs, MPL Core assets and SPL tokens. They are on `RpcClient` and use the same endpoint. Requests take the API's own camelCase parameters; responses keep its field names.
+
+```ts
+import { RpcClientBuilder, assetName, assetOwner } from '@orbitflare/sdk';
+
+const client = new RpcClientBuilder().url('https://fra.rpc.orbitflare.com').build();
+
+const asset = await client.getAsset('GJfYbfW7gufzFYfm8gFatrUE71wYsjay6FwzDkTa3vaD');
+console.log(assetName(asset), assetOwner(asset));
+
+const portfolio = await client.getAssetsByOwner({
+  ownerAddress: '86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY',
+  options: { showFungible: true, showNativeBalance: true },
+});
+
+const tokens = await client.searchAssets({
+  ownerAddress: '86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY',
+  tokenType: 'fungible',
+});
+
+// Every asset in a collection, page by page.
+const all = await client
+  .pages('getAssetsByGroup', {
+    groupKey: 'collection',
+    groupValue: 'CDDyz6MHYY8972DPCXiEeReCxGqJSCbxHnimrvoyWrFF',
+  })
+  .collectItems();
+```
+
+| Method | Returns |
+|---|---|
+| `getAsset(id, options?)` | `Asset` |
+| `getAssetBatch(ids, options?)` | `(Asset \| null)[]` in request order (auto-chunks to 1,000) |
+| `getAssetProof(id)` | `AssetProof` for a compressed asset |
+| `getAssetProofBatch(ids)` | Proofs keyed by asset ID (auto-chunks to 1,000) |
+| `getAssetWithProof(id, options?)` | Asset and proof in one call, for Bubblegum instructions |
+| `getAssetsByOwner(req)` | `AssetList`, with `nativeBalance` when asked |
+| `getAssetsByGroup(req)` | `AssetList` |
+| `getAssetsByCreator(req)` | `AssetList` |
+| `getAssetsByAuthority(req)` | `AssetList` |
+| `searchAssets(req)` | `AssetList` |
+| `getTokenAccounts(req)` | `TokenAccountList`, by owner, mint or both |
+| `getNftEditions(req)` | `NftEditions` of a master edition |
+| `getSignaturesForAsset(req)` | `AssetSignatures` (`{ signature, instruction }` items) |
+| `pages(method, req)` | Walks every page of a list request with `for await`, by cursor or page number |
+
+Helpers: `assetName`, `assetSymbol`, `assetImage`, `assetOwner`, `assetCollection`, `isCompressed` and `proofPath(proof, canopyDepth)`. List requests take `page`, `limit`, `cursor`, `before`, `after` and `sortBy`; use one paging style per request.
+
 ## Apex
 
 [Apex](https://apex.orbitflare.com) is OrbitFlare's transaction landing service. You send a signed transaction to the endpoint nearest you, and Apex races it to the upcoming leader over staked validator clients, Jito bundles and the leader TPUs at once. `ApexClient` covers Apex's HTTP routes: JSON-RPC `sendTransaction`, the binary `/send-bin` route, batches, bundles and `getTipAccounts`.
@@ -404,7 +454,7 @@ const client = new RpcClientBuilder()
 
 ## Examples
 
-Fourteen runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
+Fifteen runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
 
 ```bash
 git clone https://github.com/orbitflare/orbitflare-sdk-ts.git
@@ -417,6 +467,7 @@ export ORBITFLARE_LICENSE_KEY=ORBIT-...
 
 npm run example:rpc-basic
 npm run example:rpc-full
+npm run example:das
 npm run example:apex-basic
 npm run example:apex-full
 npm run example:ws-basic
