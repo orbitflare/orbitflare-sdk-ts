@@ -92,10 +92,20 @@ message FilteredTransaction {
   TransactionMessage transaction = 2;
 }
 
-// TransactionMessage — a flat transaction representation (all fields inline).
+// TransactionMessage - a flat transaction representation (all fields inline).
+//
 // Fields 1-13 are the core transaction and are always present (the default
-// "lean" output). Fields 14-21 are optional enrichment, emitted only when the
-// session opts in via SubscribeRequestFilterTransactions.include_enrichment.
+// "lean" output). Fields 14-22 and 24 are optional enrichment, emitted only
+// when the session opts in via
+// SubscribeRequestFilterTransactions.include_enrichment.
+//
+// Field 23 (config) is NOT enrichment-gated: it is intrinsic transaction data
+// and is always sent when the transaction is V1.
+//
+// Fields 23-24 were added for SIMD-0385 Transaction V1. They are additive:
+// a client built against the previous version of this file skips them as
+// unknown fields and continues to decode every other field normally. No
+// action is required to keep working, and there is no opt-in flag.
 message TransactionMessage {
   // Identity / placement
   uint64 slot      = 1;
@@ -149,28 +159,90 @@ message TransactionMessage {
   // enrichment (same gate as fields 14-21).
   bool alt_resolution_incomplete = 22;
 
-  // SIMD-0385 Transaction V1 config, carried in the message body. PRESENT ONLY
-  // FOR V1 (absent for legacy and V0); its presence is how you identify a V1
-  // transaction. Always sent (not enrichment-gated) — it is intrinsic tx data.
-  // version test: config present -> v1; else versioned -> v0; else legacy.
-  optional TransactionConfig config = 23;
+  // ---- SIMD-0385 Transaction V1 ----
 
-  // Priority fee in TOTAL LAMPORTS, populated for ALL versions so they can be
-  // ranked against one another. Use this, not compute_unit_price (17), to sort
-  // by fee — field 17 is absent for every V1 tx. For v1 this is
-  // config.priority_fee; for legacy/v0 it is derived from the ComputeBudget
-  // instructions. Emitted only under enrichment.
-  optional uint64 priority_fee_lamports = 24;
+  // Transaction config, carried in the message body by V1 transactions.
+  //
+  // PRESENT ONLY FOR V1. Absent for legacy and V0. The presence of this field
+  // is how you identify a V1 transaction -- see the version table below.
+  //
+  // Always sent (not enrichment-gated), because it is intrinsic transaction
+  // data rather than something we derive.
+  //
+  //   version | versioned (fn 10) | config (fn 23)
+  //   --------|-------------------|----------------
+  //   legacy  | false             | absent
+  //   v0      | true              | absent
+  //   v1      | true              | PRESENT
+  //
+  // Test config first: `versioned` is true for both v0 and v1.
+  TransactionConfig config = 23;
+
+  // Priority fee in TOTAL LAMPORTS, populated for ALL THREE versions so they
+  // can be ranked against one another.
+  //
+  // Use this, not compute_unit_price (fn 17), to order transactions by fee.
+  // Field 17 is micro-lamports per compute unit read from a
+  // SetComputeUnitPrice instruction; V1 has no such instruction, so field 17
+  // is ABSENT for every V1 transaction and sorting on it alone ranks all V1
+  // traffic last.
+  //
+  //   v1          : config.priority_fee verbatim
+  //   legacy / v0 : derived from the ComputeBudget instructions --
+  //                   limit = compute_unit_limit, or if unset
+  //                           min(200000 * num_instructions, 1400000)
+  //                   fee   = ceil(limit * compute_unit_price / 1000000)
+  //
+  // Emitted only when the session opts into enrichment.
+  uint64 priority_fee_lamports = 24;
 }
 
-// Transaction-level configuration carried by V1 messages (SIMD-0385). Replaces
-// the ComputeBudget instructions used by legacy/V0. Explicit presence: an absent
-// field means the sender requested nothing, which is NOT the same as zero.
+// Transaction-level configuration carried by V1 messages (SIMD-0385).
+//
+// V1 replaces the ComputeBudget instructions used by legacy and V0 with four
+// values encoded directly in the message.
+//
+// A value of 0 means "not requested" for every field here, so you can read
+// the values directly without checking presence. config_mask records what
+// the sender literally set, if you need that.
+//
+// ComputeBudget instructions inside a V1 transaction are ignored by the
+// runtime even when present, so do not read configuration out of them for a
+// transaction that carries this message.
 message TransactionConfig {
-  optional uint64 priority_fee = 1;                     // TOTAL lamports, not per-CU. Absent = 0.
-  optional uint32 compute_unit_limit = 2;              // Absent = 0 requested.
-  optional uint32 loaded_accounts_data_size_limit = 3; // Bytes. Absent = 0 (legacy/V0 default is 64 MiB).
-  optional uint32 heap_size = 4;                        // Bytes, multiple of 1024 in [32768, 262144]. Absent = 32 KiB default.
+  // Priority fee in TOTAL LAMPORTS. This is not a per-compute-unit price.
+  // 0 means no priority fee was requested.
+  uint64 priority_fee = 1;
+
+  // Requested compute unit limit. 0 means 0 was requested, which SIMD-0385
+  // also makes the default when the field is not set -- the two are the same.
+  uint32 compute_unit_limit = 2;
+
+  // Requested loaded accounts data size limit, in bytes. 0 means 0, which
+  // SIMD-0385 treats identically to unset (both reserve one 32 KiB page for
+  // cost-model purposes). Note this differs from legacy/V0, where the default
+  // is 64 MiB.
+  uint32 loaded_accounts_data_size_limit = 3;
+
+  // Requested heap size in bytes. When set it is always a multiple of 1024 in
+  // the inclusive range [32768, 262144], so 0 unambiguously means "not
+  // requested" and the 32 KiB default applies.
+  uint32 heap_size = 4;
+
+  // The raw SIMD-0385 TransactionConfigMask, exactly as it appeared in the
+  // transaction. This is the authoritative record of which values the sender
+  // actually requested:
+  //
+  //   bits 0-1  priority fee        (both bits set together, or neither)
+  //   bit  2    compute unit limit
+  //   bit  3    loaded accounts data size limit
+  //   bit  4    heap size
+  //
+  // You do not need this for normal use: for every field above, a value of 0
+  // and "not requested" mean the same thing, so you can read the values
+  // directly. It is here for callers that want to reproduce the sender's
+  // exact intent, and it is 0 when the sender requested nothing at all.
+  uint32 config_mask = 5;
 }
 
 message CompiledInstruction {
@@ -187,15 +259,25 @@ message MessageAddressTableLookup {
 
 // ============= SubscribeSlots =============
 
-// SubscribeSlots takes no request parameters.
 message SubscribeSlotsRequest {
+  // Opt in to SLOT_STATUS_BLOCK_FOOTER events (Alpenglow block footers).
+  // Off by default: a client that leaves it unset gets exactly the events it
+  // got before this field existed.
+  bool include_block_footer = 1;
 }
 
 enum SlotStatus {
-  SLOT_STATUS_UNSPECIFIED = 0;
-  SLOT_STATUS_ALIVE       = 1;  // first shred of this slot received
-  SLOT_STATUS_COMPLETE    = 2;  // last shred of this slot received
-  SLOT_STATUS_DEAD        = 3;  // slot skipped, or superseded by later slots without completing
+  SLOT_STATUS_UNSPECIFIED  = 0;
+  SLOT_STATUS_ALIVE        = 1;  // first shred of this slot received
+  SLOT_STATUS_COMPLETE     = 2;  // last shred of this slot received
+  SLOT_STATUS_DEAD         = 3;  // slot skipped, or superseded by later slots without completing
+  // The slot's block footer; SlotEvent.block_footer is set. Sent only to
+  // streams that set include_block_footer, at most once per slot. It usually
+  // arrives right around COMPLETE, before or after it (the two are not
+  // ordered), and can also follow DEAD or arrive for a slot that never gets
+  // COMPLETE. It does not change the slot's status and is not a terminal
+  // event. A slot without a footer gets no such event.
+  SLOT_STATUS_BLOCK_FOOTER = 4;
 }
 
 message SlotEvent {
@@ -208,6 +290,57 @@ message SlotEvent {
   // "unknown parent" (e.g. a DEAD event for a slot that was never observed).
   uint64     parent_slot    = 4;
   uint64     sequence       = 5;  // monotonic per-stream
+  // Set only when status == SLOT_STATUS_BLOCK_FOOTER.
+  BlockFooter block_footer  = 6;
+}
+
+// Alpenglow block footer, delivered before the block has been executed.
+// The BLS signatures in the certificates are not checked: treat the
+// contents as the slot leader's claims, not as proof of finality.
+message BlockFooter {
+  uint64 slot = 1;
+  reserved 2;
+  bytes  bank_hash = 3;                 // 32 bytes
+  uint64 block_producer_time_nanos = 4;
+  bytes  block_user_agent = 5;          // 0-255 bytes, raw
+  reserved 6, 7, 8;
+
+  BlockFooterFinalCert       block_final_cert  = 9;
+  BlockFooterSkipRewardCert  skip_reward_cert  = 10;
+  BlockFooterNotarRewardCert notar_reward_cert = 11;
+
+  // 32 bytes: the Alpenglow block id, the same value validators vote on and
+  // certify, and that the next block names as its parent. Like the rest of
+  // the footer it is not verified against a signature. Empty when it could
+  // not be determined for this slot.
+  bytes block_id = 100;
+}
+
+enum BlockFooterSignatureKind {
+  COMPRESSED_BLS12_381_G2 = 0;
+}
+
+message BlockFooterVotesAggregate {
+  BlockFooterSignatureKind signature_kind = 1;
+  bytes signature     = 2;              // 96 bytes
+  bytes block_id      = 3;              // 32 bytes when the cert names a block, else empty
+  bytes signer_bitmap = 4;
+}
+
+message BlockFooterFinalCert {
+  uint64 slot = 1;
+  BlockFooterVotesAggregate final_aggregate = 2;
+  BlockFooterVotesAggregate notar_aggregate = 3;
+}
+
+message BlockFooterSkipRewardCert {
+  uint64 slot = 1;
+  BlockFooterVotesAggregate aggregate = 2;
+}
+
+message BlockFooterNotarRewardCert {
+  uint64 slot = 1;
+  BlockFooterVotesAggregate aggregate = 2;
 }
 
 // ============= Unary RPC messages =============

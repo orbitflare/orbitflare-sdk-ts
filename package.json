@@ -1,6 +1,6 @@
 {
   "name": "@orbitflare/sdk",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "TypeScript SDK for OrbitFlare - RPC, DAS, Apex transaction landing, gRPC (Yellowstone), JetStream, and WebSocket clients for Solana",
   "license": "MIT",
   "author": "OrbitFlare",
@@ -99,7 +99,9 @@
     "example:jetstream-filters": "tsx examples/jetstream_filters.ts",
     "example:jetstream-v2-basic": "tsx examples/jetstream_v2_basic.ts",
     "example:jetstream-v2-full": "tsx examples/jetstream_v2_full.ts",
-    "example:grpc-filters": "tsx examples/grpc_filters.ts"
+    "example:jetstream-v2-slots": "tsx examples/jetstream_v2_slots.ts",
+    "example:grpc-filters": "tsx examples/grpc_filters.ts",
+    "example:grpc-block-footers": "tsx examples/grpc_block_footers.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.0"

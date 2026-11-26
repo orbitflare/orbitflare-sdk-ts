@@ -4,6 +4,7 @@ import { Commitment, Lamports, Memcmp } from '../src/filters.js';
 import {
   AccountFilter,
   BlockFilter,
+  BlockFooterFilter,
   DeshredTransactionFilter,
   SlotFilter,
   SubscribeRequestBuilder,
@@ -54,6 +55,8 @@ describe('gRPC SubscribeRequestBuilder', () => {
       .blocks('blocks', new BlockFilter().accountInclude(['acc1']).includeTransactions(true))
       .blocksMeta('meta')
       .entry('entry')
+      .blockFooter('bf', new BlockFooterFilter().includeCertificates(true))
+      .blockFooter('bf-lean', new BlockFooterFilter())
       .commitment(Commitment.Confirmed)
       .accountsDataSlice(0, 32)
       .fromSlot(100)
@@ -81,6 +84,10 @@ describe('gRPC SubscribeRequestBuilder', () => {
     expect(req.blocks['blocks']!.includeTransactions).toBe(true);
     expect(req.blocksMeta['meta']).toEqual({});
     expect(req.entry['entry']).toEqual({});
+    expect(req.blockFooter['bf']).toEqual({ includeCertificates: true });
+    expect(req.blockFooter['bf-lean']).toEqual({ includeCertificates: undefined });
+    expect(req.transactions['txs']!.cuckooAccountInclude).toBeUndefined();
+    expect(req.transactions['txs']!.tokenAccounts).toBeUndefined();
     expect(req.commitment).toBe(Commitment.Confirmed);
     expect(req.accountsDataSlice).toEqual([{ offset: 0n, length: 32n }]);
     expect(req.fromSlot).toBe(100n);

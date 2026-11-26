@@ -1,15 +1,28 @@
-import { type ClientDuplexStream, type ClientOptions } from '@grpc/grpc-js';
+import { type ClientDuplexStream, Metadata, type ServiceError } from '@grpc/grpc-js';
 
-import { apiKeyInterceptors, parseAddress } from './address.js';
+import { parseAddress } from './address.js';
 import { EndpointSet } from './endpoint.js';
-import { OrbitflareError, sanitizeUrl } from './error.js';
+import { OrbitflareError } from './error.js';
+import { type ConnectionEvents, endpointLabel } from './events.js';
 import { type Logger, type LogLevel, resolveLogger } from './logger.js';
-import { defaultRetryPolicy, delayForAttempt, hasAttemptsLeft, type RetryPolicy } from './retry.js';
+import { defaultRetryPolicy, type RetryPolicy } from './retry.js';
+import {
+  clientOptions,
+  DEFAULT_KEEPALIVE_SECS,
+  DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+  DEFAULT_MAX_MISSED_PONGS,
+  DEFAULT_PING_INTERVAL_SECS,
+  Inbox,
+  Reconnector,
+  type StreamOptions,
+  toGrpcError,
+} from './streaming.js';
 import {
   GeyserClient as ProtoGeyserClient,
   type SubscribeRequest,
   type SubscribeRequestFilterAccounts,
   type SubscribeRequestFilterAccountsFilter,
+  type SubscribeRequestFilterBlockFooter,
   type SubscribeRequestFilterBlocks,
   type SubscribeRequestFilterDeshredTransactions,
   type SubscribeRequestFilterSlots,
@@ -21,27 +34,44 @@ import { Commitment, Lamports, Memcmp } from './filters.js';
 
 export { Commitment, Lamports, Memcmp } from './filters.js';
 export type { LamportsCmp, MemcmpData } from './filters.js';
+export { ConnectionEvents, type ConnectionEvent } from './events.js';
 
-const DEFAULT_PING_INTERVAL_SECS = 10;
-const DEFAULT_MAX_MISSED_PONGS = 3;
+const REPLAY_INFO_TIMEOUT_MS = 10_000;
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+export interface ConnectInfo {
+  endpoint: string;
+  attempt: number;
+  reconnect: boolean;
+  lastSlot?: bigint;
+}
+
+type RequestSource =
+  | { kind: 'fixed'; request: SubscribeRequest }
+  | { kind: 'build'; build: (info: ConnectInfo) => SubscribeRequest };
+
+export class GeyserHandle {
+  constructor(private readonly stream: GeyserStream) {}
+
+  update(request: SubscribeRequest): void {
+    this.stream.update(request);
+  }
+}
 
 export class GeyserStream {
-  private buffer: SubscribeUpdate[] = [];
-  private waiting: ((v: SubscribeUpdate | undefined) => void)[] = [];
-  private errored?: OrbitflareError;
-  private closed = false;
+  private inbox = new Inbox<SubscribeUpdate>();
+  private call?: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
+  private pending: SubscribeRequest[] = [];
+  private abort?: () => void;
+  _connectedBefore = false;
+  _lastSlot?: bigint;
 
-  constructor(private readonly onClose: () => void) {}
+  constructor(
+    private readonly rc: Reconnector,
+    private source: RequestSource,
+  ) {}
 
-  async next(): Promise<SubscribeUpdate | undefined> {
-    if (this.buffer.length > 0) return this.buffer.shift();
-    if (this.errored) throw this.errored;
-    if (this.closed) return undefined;
-    return new Promise<SubscribeUpdate | undefined>((resolve) => {
-      this.waiting.push(resolve);
-    });
+  next(): Promise<SubscribeUpdate | undefined> {
+    return this.inbox.next();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterableIterator<SubscribeUpdate> {
@@ -52,45 +82,61 @@ export class GeyserStream {
     }
   }
 
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.onClose();
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+  handle(): GeyserHandle {
+    return new GeyserHandle(this);
   }
 
-  _push(update: SubscribeUpdate): void {
-    if (this.closed) return;
-    if (this.waiting.length > 0) {
-      this.waiting.shift()!(update);
+  update(request: SubscribeRequest): void {
+    if (this.inbox.closed) throw OrbitflareError.stream('stream closed');
+    const update: SubscribeRequest = { ...request, fromSlot: undefined };
+    if (this.source.kind === 'fixed') this.source = { kind: 'fixed', request: update };
+    if (this.call) {
+      try {
+        this.call.write(update);
+      } catch {}
     } else {
-      this.buffer.push(update);
+      this.pending.push(update);
     }
   }
 
+  events(): ConnectionEvents {
+    return this.rc.events.subscribe();
+  }
+
+  close(): void {
+    if (!this.inbox.close()) return;
+    this.rc.stop();
+    this.abort?.();
+  }
+
+  _request(info: ConnectInfo): SubscribeRequest {
+    this.pending = [];
+    return this.source.kind === 'fixed' ? this.source.request : this.source.build(info);
+  }
+
+  _attach(
+    call: ClientDuplexStream<SubscribeRequest, SubscribeUpdate> | undefined,
+    abort?: () => void,
+  ): void {
+    this.call = call;
+    this.abort = abort;
+    if (!call) return;
+    const pending = this.pending;
+    this.pending = [];
+    for (const update of pending) call.write(update);
+  }
+
+  _push(update: SubscribeUpdate): void {
+    this.inbox.push(update);
+  }
+
   _fail(err: OrbitflareError): void {
-    if (this.closed) return;
-    this.errored = err;
-    this.closed = true;
-    this.onClose();
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    this.inbox.fail(err);
   }
 }
 
-interface GeyserClientOptions {
-  endpoints: EndpointSet;
-  apiKey?: string;
-  retry: RetryPolicy;
-  timeoutSecs: number;
-  keepaliveSecs: number;
-  pingIntervalSecs: number;
-  maxMissedPongs: number;
-  channelCapacity: number;
-  logger: Logger;
-}
-
 export class GeyserClient {
-  constructor(private readonly opts: GeyserClientOptions) {}
+  constructor(private readonly opts: StreamOptions) {}
 
   subscribeYaml(path: string): GeyserStream {
     const cfg = loadGeyserConfig(path);
@@ -98,73 +144,117 @@ export class GeyserClient {
   }
 
   subscribe(request: SubscribeRequest): GeyserStream {
-    const stream = new GeyserStream(() => {
-      shutdownRequested = true;
-    });
-    let shutdownRequested = false;
+    return this.spawn({ kind: 'fixed', request });
+  }
 
-    const { logger } = this.opts;
-    void (async () => {
-      let attempt = 0;
-      while (!shutdownRequested) {
-        attempt += 1;
-        const idx = this.opts.endpoints.pick();
-        const url = this.opts.endpoints.get(idx);
-        logger.info('connecting (grpc)', { endpoint: sanitizeUrl(url), attempt });
+  subscribeWith(build: (info: ConnectInfo) => SubscribeRequest): GeyserStream {
+    return this.spawn({ kind: 'build', build });
+  }
 
-        try {
-          await runConnection(
-            url,
-            request,
-            stream,
-            this.opts,
-            () => shutdownRequested,
-            () => {
-              attempt = 0;
-              logger.info('connected, streaming (grpc)');
-            },
-          );
-          this.opts.endpoints.markSuccess(idx);
-          return;
-        } catch (e) {
-          this.opts.endpoints.markFailure(idx);
-          const err = e instanceof OrbitflareError ? e : OrbitflareError.transport(e);
-          if (!hasAttemptsLeft(this.opts.retry, attempt)) {
-            stream._fail(err.withEndpoint(url));
-            return;
-          }
-          const delayMs = delayForAttempt(this.opts.retry, attempt);
-          logger.warn('reconnecting (grpc)', {
-            error: err,
-            endpoint: sanitizeUrl(url),
-            attempt,
-            delayMs,
-          });
-          await sleep(delayMs);
-        }
-      }
-    })();
-
+  private spawn(source: RequestSource): GeyserStream {
+    const rc = new Reconnector(this.opts, 'grpc');
+    const stream = new GeyserStream(rc, source);
+    void rc.run(
+      (url, idx) => runConnection(url, idx, rc, stream),
+      (err) => stream._fail(err),
+    );
     return stream;
   }
 }
 
+function slotOf(update: SubscribeUpdate): bigint | undefined {
+  return (
+    update.slot?.slot ??
+    update.transaction?.slot ??
+    update.transactionStatus?.slot ??
+    update.account?.slot ??
+    update.block?.slot ??
+    update.blockMeta?.slot ??
+    update.entry?.slot
+  );
+}
+
+async function replayFrom(
+  client: ProtoGeyserClient,
+  rc: Reconnector,
+  wanted: bigint,
+): Promise<bigint | undefined> {
+  const answer = await new Promise<{ firstAvailable?: bigint } | ServiceError>((resolve) => {
+    client.subscribeReplayInfo(
+      {},
+      new Metadata(),
+      { deadline: Date.now() + REPLAY_INFO_TIMEOUT_MS },
+      (err, resp) => resolve(err ?? resp),
+    );
+  });
+  if (answer instanceof Error) {
+    rc.opts.logger.debug('replay window lookup failed; using fromSlot as is', {
+      error: answer.message,
+    });
+    return wanted;
+  }
+  const available = answer.firstAvailable;
+  if (available === undefined) {
+    rc.opts.logger.warn('endpoint does not support replay; starting live', { requested: wanted });
+    rc.emit({ type: 'replayUnavailable', requested: wanted });
+    return undefined;
+  }
+  if (wanted < available) {
+    rc.opts.logger.warn(
+      'fromSlot is older than the replay window; starting at the oldest available slot',
+      { requested: wanted, available },
+    );
+    rc.emit({ type: 'replayClamped', requested: wanted, available });
+    return available;
+  }
+  return wanted;
+}
+
+function pingRequest(id: number): SubscribeRequest {
+  return {
+    accounts: {},
+    slots: {},
+    transactions: {},
+    transactionsStatus: {},
+    blocks: {},
+    blocksMeta: {},
+    entry: {},
+    commitment: undefined,
+    accountsDataSlice: [],
+    ping: { id },
+    fromSlot: undefined,
+    blockFooter: {},
+  };
+}
+
 async function runConnection(
   url: string,
-  request: SubscribeRequest,
+  idx: number,
+  rc: Reconnector,
   stream: GeyserStream,
-  opts: GeyserClientOptions,
-  shouldShutdown: () => boolean,
-  onConnected: () => void,
 ): Promise<void> {
   const { target, credentials } = parseAddress(url);
-  const clientOpts: Partial<ClientOptions> = {
-    interceptors: apiKeyInterceptors(opts.apiKey),
-    'grpc.keepalive_time_ms': opts.keepaliveSecs * 1000,
-    'grpc.keepalive_timeout_ms': opts.timeoutSecs * 1000,
-    'grpc.keepalive_permit_without_calls': 1,
-  };
-  const client = new ProtoGeyserClient(target, credentials, clientOpts);
+  const client = new ProtoGeyserClient(target, credentials, clientOptions(rc.opts));
+
+  let request: SubscribeRequest;
+  try {
+    request = stream._request({
+      endpoint: endpointLabel(url),
+      attempt: rc.currentAttempt,
+      reconnect: stream._connectedBefore,
+      lastSlot: stream._lastSlot,
+    });
+    if (request.fromSlot !== undefined) {
+      request = { ...request, fromSlot: await replayFrom(client, rc, request.fromSlot) };
+    }
+  } catch (e) {
+    client.close();
+    throw e;
+  }
+  if (rc.shouldStop) {
+    client.close();
+    return;
+  }
 
   let call: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
   try {
@@ -187,20 +277,29 @@ async function runConnection(
 
   const cleanup = () => {
     if (pingTimer) clearInterval(pingTimer);
+    stream._attach(undefined);
     try {
-      call.end();
+      call.cancel();
     } catch {}
     client.close();
   };
 
+  const markConnected = () => {
+    if (connected) return;
+    connected = true;
+    rc.onConnected(idx);
+    stream._connectedBefore = true;
+  };
+
+  call.on('metadata', markConnected);
   call.on('data', (update: SubscribeUpdate) => {
-    if (!connected) {
-      connected = true;
-      onConnected();
-    }
-    if (update.pong) {
-      missedPongs = 0;
-      return;
+    markConnected();
+    missedPongs = 0;
+    rc.onMessage();
+    if (update.pong) return;
+    const slot = slotOf(update);
+    if (slot !== undefined && (stream._lastSlot === undefined || slot > stream._lastSlot)) {
+      stream._lastSlot = slot;
     }
     stream._push(update);
   });
@@ -215,51 +314,41 @@ async function runConnection(
 
   try {
     call.write(request);
+    stream._attach(call, () => {
+      resolveDone();
+      cleanup();
+    });
   } catch (e) {
     cleanup();
     throw OrbitflareError.transport(e);
   }
+  if (rc.shouldStop) {
+    resolveDone!();
+    cleanup();
+  }
 
   pingTimer = setInterval(() => {
-    if (shouldShutdown()) {
-      cleanup();
+    if (rc.shouldStop) {
       resolveDone();
+      cleanup();
       return;
     }
-    if (missedPongs >= opts.maxMissedPongs) {
+    if (missedPongs >= rc.opts.maxMissedPongs) {
       cleanup();
-      rejectDone(OrbitflareError.stream(`no pong after ${opts.maxMissedPongs} pings`));
+      rejectDone(OrbitflareError.stream(`no pong after ${rc.opts.maxMissedPongs} pings`));
       return;
     }
     try {
-      call.write({
-        accounts: {},
-        slots: {},
-        transactions: {},
-        transactionsStatus: {},
-        blocks: {},
-        blocksMeta: {},
-        entry: {},
-        commitment: undefined,
-        accountsDataSlice: [],
-        ping: { id: pingId },
-        fromSlot: undefined,
-      } as SubscribeRequest);
+      call.write(pingRequest(pingId));
       pingId += 1;
       missedPongs += 1;
     } catch {
       cleanup();
       rejectDone(OrbitflareError.stream('outbound closed'));
     }
-  }, opts.pingIntervalSecs * 1000);
+  }, rc.opts.pingIntervalSecs * 1000);
 
   await done;
-}
-
-function toGrpcError(e: any): OrbitflareError {
-  const code = typeof e?.code === 'number' ? e.code : 2;
-  const message = typeof e?.details === 'string' ? e.details : (e?.message ?? 'grpc error');
-  return OrbitflareError.grpc(code, message);
 }
 
 export class GeyserClientBuilder {
@@ -268,10 +357,11 @@ export class GeyserClientBuilder {
   private _apiKey?: string;
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _timeoutSecs = 30;
-  private _keepaliveSecs = 60;
+  private _keepaliveSecs = DEFAULT_KEEPALIVE_SECS;
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
   private _channelCapacity = 4096;
+  private _maxDecodingMessageSize = DEFAULT_MAX_DECODING_MESSAGE_SIZE;
   private _logger?: Logger;
   private _logLevel?: LogLevel;
 
@@ -343,6 +433,11 @@ export class GeyserClientBuilder {
     return this;
   }
 
+  maxDecodingMessageSize(bytes: number): this {
+    this._maxDecodingMessageSize = bytes;
+    return this;
+  }
+
   build(): GeyserClient {
     const url = this._url ?? process.env.ORBITFLARE_GRPC_URL;
     if (!url) {
@@ -359,6 +454,7 @@ export class GeyserClientBuilder {
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
       channelCapacity: this._channelCapacity,
+      maxDecodingMessageSize: this._maxDecodingMessageSize,
       logger: resolveLogger(this._logger, this._logLevel),
     });
   }
@@ -556,6 +652,19 @@ export class BlockFilter {
   }
 }
 
+export class BlockFooterFilter {
+  private _includeCertificates?: boolean;
+
+  includeCertificates(value: boolean): this {
+    this._includeCertificates = value;
+    return this;
+  }
+
+  toProto(): SubscribeRequestFilterBlockFooter {
+    return { includeCertificates: this._includeCertificates };
+  }
+}
+
 export class DeshredTransactionFilter {
   private _vote?: boolean;
   private _accountInclude: string[] = [];
@@ -600,6 +709,7 @@ export class SubscribeRequestBuilder {
   private _blocks: Record<string, BlockFilter> = {};
   private _blocksMeta: string[] = [];
   private _entry: string[] = [];
+  private _blockFooter: Record<string, BlockFooterFilter> = {};
   private _commitment?: Commitment;
   private _accountsDataSlice: { offset: number; length: number }[] = [];
   private _fromSlot?: number;
@@ -636,6 +746,11 @@ export class SubscribeRequestBuilder {
 
   entry(name: string): this {
     this._entry.push(name);
+    return this;
+  }
+
+  blockFooter(name: string, filter: BlockFooterFilter): this {
+    this._blockFooter[name] = filter;
     return this;
   }
 
@@ -677,6 +792,7 @@ export class SubscribeRequestBuilder {
       // and ignores its filters, so the subscription would never start.
       ping: undefined,
       fromSlot: this._fromSlot === undefined ? undefined : BigInt(this._fromSlot),
+      blockFooter: mapValues(this._blockFooter, (f) => f.toProto()),
     };
   }
 }

@@ -107,3 +107,17 @@ describe('retry policy', () => {
     expect(dn).toBeLessThanOrEqual(625);
   });
 });
+
+describe('transport errors', () => {
+  it('show their cause', () => {
+    const inner = new Error('connection refused');
+    const outer = new Error('transport error', { cause: inner });
+    expect(OrbitflareError.transport(outer).message).toBe('transport error: connection refused');
+  });
+
+  it('do not repeat a cause already in the message', () => {
+    const inner = new Error('connection refused');
+    const outer = new Error('dial failed: connection refused', { cause: inner });
+    expect(OrbitflareError.transport(outer).message).toBe('dial failed: connection refused');
+  });
+});

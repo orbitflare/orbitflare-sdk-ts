@@ -1,15 +1,22 @@
-import { type ClientDuplexStream, type ClientOptions } from '@grpc/grpc-js';
+import { type ClientDuplexStream } from '@grpc/grpc-js';
 
-import { apiKeyInterceptors, parseAddress } from '../address.js';
+import { parseAddress } from '../address.js';
 import { EndpointSet } from '../endpoint.js';
-import { OrbitflareError, sanitizeUrl } from '../error.js';
+import { OrbitflareError } from '../error.js';
+import { type ConnectionEvents } from '../events.js';
 import { type Logger, type LogLevel, resolveLogger } from '../logger.js';
+import { defaultRetryPolicy, type RetryPolicy } from '../retry.js';
 import {
-  defaultRetryPolicy,
-  delayForAttempt,
-  hasAttemptsLeft,
-  type RetryPolicy,
-} from '../retry.js';
+  clientOptions,
+  DEFAULT_KEEPALIVE_SECS,
+  DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+  DEFAULT_MAX_MISSED_PONGS,
+  DEFAULT_PING_INTERVAL_SECS,
+  Inbox,
+  Reconnector,
+  type StreamOptions,
+  toGrpcError,
+} from '../streaming.js';
 import {
   JetstreamClient as ProtoJetstreamClient,
   type SubscribeRequest,
@@ -18,27 +25,16 @@ import {
 import { jetstreamConfigToRequest, loadJetstreamConfig } from '../config.js';
 
 export { TransactionFilter, SubscribeRequestBuilder } from './filters.js';
-
-const DEFAULT_PING_INTERVAL_SECS = 10;
-const DEFAULT_MAX_MISSED_PONGS = 3;
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+export { ConnectionEvents, type ConnectionEvent } from '../events.js';
 
 export class JetstreamStream {
-  private buffer: SubscribeUpdate[] = [];
-  private waiting: ((v: SubscribeUpdate | undefined) => void)[] = [];
-  private errored?: OrbitflareError;
-  private closed = false;
+  private inbox = new Inbox<SubscribeUpdate>();
+  private abort?: () => void;
 
-  constructor(private readonly onClose: () => void) {}
+  constructor(private readonly rc: Reconnector) {}
 
-  async next(): Promise<SubscribeUpdate | undefined> {
-    if (this.buffer.length > 0) return this.buffer.shift();
-    if (this.errored) throw this.errored;
-    if (this.closed) return undefined;
-    return new Promise<SubscribeUpdate | undefined>((resolve) => {
-      this.waiting.push(resolve);
-    });
+  next(): Promise<SubscribeUpdate | undefined> {
+    return this.inbox.next();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterableIterator<SubscribeUpdate> {
@@ -49,45 +45,31 @@ export class JetstreamStream {
     }
   }
 
+  events(): ConnectionEvents {
+    return this.rc.events.subscribe();
+  }
+
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.onClose();
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    if (!this.inbox.close()) return;
+    this.rc.stop();
+    this.abort?.();
+  }
+
+  _onAbort(abort: (() => void) | undefined): void {
+    this.abort = abort;
   }
 
   _push(update: SubscribeUpdate): void {
-    if (this.closed) return;
-    if (this.waiting.length > 0) {
-      this.waiting.shift()!(update);
-    } else {
-      this.buffer.push(update);
-    }
+    this.inbox.push(update);
   }
 
   _fail(err: OrbitflareError): void {
-    if (this.closed) return;
-    this.errored = err;
-    this.closed = true;
-    this.onClose();
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    this.inbox.fail(err);
   }
 }
 
-interface JetstreamClientOptions {
-  endpoints: EndpointSet;
-  apiKey?: string;
-  retry: RetryPolicy;
-  timeoutSecs: number;
-  keepaliveSecs: number;
-  pingIntervalSecs: number;
-  maxMissedPongs: number;
-  channelCapacity: number;
-  logger: Logger;
-}
-
 export class JetstreamClient {
-  constructor(private readonly opts: JetstreamClientOptions) {}
+  constructor(private readonly opts: StreamOptions) {}
 
   subscribeYaml(path: string): JetstreamStream {
     const cfg = loadJetstreamConfig(path);
@@ -95,73 +77,25 @@ export class JetstreamClient {
   }
 
   subscribe(request: SubscribeRequest): JetstreamStream {
-    let shutdownRequested = false;
-    const stream = new JetstreamStream(() => {
-      shutdownRequested = true;
-    });
-
-    const { logger } = this.opts;
-    void (async () => {
-      let attempt = 0;
-      while (!shutdownRequested) {
-        attempt += 1;
-        const idx = this.opts.endpoints.pick();
-        const url = this.opts.endpoints.get(idx);
-        logger.info('connecting (jetstream)', { endpoint: sanitizeUrl(url), attempt });
-
-        try {
-          await runConnection(
-            url,
-            request,
-            stream,
-            this.opts,
-            () => shutdownRequested,
-            () => {
-              attempt = 0;
-              logger.info('connected, streaming (jetstream)');
-            },
-          );
-          this.opts.endpoints.markSuccess(idx);
-          return;
-        } catch (e) {
-          this.opts.endpoints.markFailure(idx);
-          const err = e instanceof OrbitflareError ? e : OrbitflareError.transport(e);
-          if (!hasAttemptsLeft(this.opts.retry, attempt)) {
-            stream._fail(err.withEndpoint(url));
-            return;
-          }
-          const delayMs = delayForAttempt(this.opts.retry, attempt);
-          logger.warn('reconnecting (jetstream)', {
-            error: err,
-            endpoint: sanitizeUrl(url),
-            attempt,
-            delayMs,
-          });
-          await sleep(delayMs);
-        }
-      }
-    })();
-
+    const rc = new Reconnector(this.opts, 'jetstream');
+    const stream = new JetstreamStream(rc);
+    void rc.run(
+      (url, idx) => runConnection(url, idx, rc, request, stream),
+      (err) => stream._fail(err),
+    );
     return stream;
   }
 }
 
 async function runConnection(
   url: string,
+  idx: number,
+  rc: Reconnector,
   request: SubscribeRequest,
   stream: JetstreamStream,
-  opts: JetstreamClientOptions,
-  shouldShutdown: () => boolean,
-  onConnected: () => void,
 ): Promise<void> {
   const { target, credentials } = parseAddress(url);
-  const clientOpts: Partial<ClientOptions> = {
-    interceptors: apiKeyInterceptors(opts.apiKey),
-    'grpc.keepalive_time_ms': opts.keepaliveSecs * 1000,
-    'grpc.keepalive_timeout_ms': opts.timeoutSecs * 1000,
-    'grpc.keepalive_permit_without_calls': 1,
-  };
-  const client = new ProtoJetstreamClient(target, credentials, clientOpts);
+  const client = new ProtoJetstreamClient(target, credentials, clientOptions(rc.opts));
 
   let call: ClientDuplexStream<SubscribeRequest, SubscribeUpdate>;
   try {
@@ -184,21 +118,25 @@ async function runConnection(
 
   const cleanup = () => {
     if (pingTimer) clearInterval(pingTimer);
+    stream._onAbort(undefined);
     try {
-      call.end();
+      call.cancel();
     } catch {}
     client.close();
   };
 
+  const markConnected = () => {
+    if (connected) return;
+    connected = true;
+    rc.onConnected(idx);
+  };
+
+  call.on('metadata', markConnected);
   call.on('data', (update: SubscribeUpdate) => {
-    if (!connected) {
-      connected = true;
-      onConnected();
-    }
-    if (update.pong) {
-      missedPongs = 0;
-      return;
-    }
+    markConnected();
+    missedPongs = 0;
+    rc.onMessage();
+    if (update.pong) return;
     stream._push(update);
   });
   call.on('error', (e) => {
@@ -212,20 +150,28 @@ async function runConnection(
 
   try {
     call.write(request);
+    stream._onAbort(() => {
+      resolveDone();
+      cleanup();
+    });
   } catch (e) {
     cleanup();
     throw OrbitflareError.transport(e);
   }
+  if (rc.shouldStop) {
+    resolveDone!();
+    cleanup();
+  }
 
   pingTimer = setInterval(() => {
-    if (shouldShutdown()) {
-      cleanup();
+    if (rc.shouldStop) {
       resolveDone();
+      cleanup();
       return;
     }
-    if (missedPongs >= opts.maxMissedPongs) {
+    if (missedPongs >= rc.opts.maxMissedPongs) {
       cleanup();
-      rejectDone(OrbitflareError.stream(`no pong after ${opts.maxMissedPongs} pings`));
+      rejectDone(OrbitflareError.stream(`no pong after ${rc.opts.maxMissedPongs} pings`));
       return;
     }
     try {
@@ -240,15 +186,9 @@ async function runConnection(
       cleanup();
       rejectDone(OrbitflareError.stream('outbound closed'));
     }
-  }, opts.pingIntervalSecs * 1000);
+  }, rc.opts.pingIntervalSecs * 1000);
 
   await done;
-}
-
-function toGrpcError(e: any): OrbitflareError {
-  const code = typeof e?.code === 'number' ? e.code : 2;
-  const message = typeof e?.details === 'string' ? e.details : (e?.message ?? 'grpc error');
-  return OrbitflareError.grpc(code, message);
 }
 
 export class JetstreamClientBuilder {
@@ -257,10 +197,11 @@ export class JetstreamClientBuilder {
   private _apiKey?: string;
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _timeoutSecs = 30;
-  private _keepaliveSecs = 60;
+  private _keepaliveSecs = DEFAULT_KEEPALIVE_SECS;
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
   private _channelCapacity = 4096;
+  private _maxDecodingMessageSize = DEFAULT_MAX_DECODING_MESSAGE_SIZE;
   private _logger?: Logger;
   private _logLevel?: LogLevel;
 
@@ -332,6 +273,11 @@ export class JetstreamClientBuilder {
     return this;
   }
 
+  maxDecodingMessageSize(bytes: number): this {
+    this._maxDecodingMessageSize = bytes;
+    return this;
+  }
+
   build(): JetstreamClient {
     const url = this._url ?? process.env.ORBITFLARE_JETSTREAM_URL;
     if (!url) {
@@ -348,6 +294,7 @@ export class JetstreamClientBuilder {
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
       channelCapacity: this._channelCapacity,
+      maxDecodingMessageSize: this._maxDecodingMessageSize,
       logger: resolveLogger(this._logger, this._logLevel),
     });
   }

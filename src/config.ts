@@ -146,6 +146,7 @@ export function geyserConfigToRequest(cfg: GeyserStreamConfig): GeyserSubscribeR
     // and ignores its filters, so the subscription would never start.
     ping: undefined,
     fromSlot: undefined,
+    blockFooter: {},
   } as GeyserSubscribeRequest;
 }
 

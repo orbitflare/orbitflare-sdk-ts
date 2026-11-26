@@ -124,3 +124,88 @@ describe('v2 api key', () => {
     }
   });
 });
+
+describe('v2 streams against a server', () => {
+  async function v2Server(handlers: Record<string, unknown>) {
+    const grpc = await import('@grpc/grpc-js');
+    const { JetstreamV2Service } = await import('../src/proto/jetstream_v2.js');
+    const server = new grpc.Server();
+    server.addService(JetstreamV2Service, handlers as never);
+    const port = await new Promise<number>((resolve, reject) =>
+      server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (e, p) =>
+        e ? reject(e) : resolve(p),
+      ),
+    );
+    return { server, url: `http://127.0.0.1:${port}`, grpc };
+  }
+
+  const fast = { initialDelayMs: 10, maxDelayMs: 10, multiplier: 2, maxAttempts: 0 };
+
+  it('asks for block footers only when opted in', async () => {
+    const seen: boolean[] = [];
+    const { server, url } = await v2Server({
+      subscribeSlots: (call: {
+        request: { includeBlockFooter: boolean };
+        write(v: unknown): void;
+        end(): void;
+      }) => {
+        seen.push(call.request.includeBlockFooter);
+        call.write({
+          slot: 1n,
+          status: 4,
+          currentLeader: new Uint8Array(),
+          parentSlot: 0n,
+          sequence: 1n,
+        });
+      },
+    });
+    try {
+      const client = new JetstreamClientBuilder().url(url).build();
+      const plain = client.subscribeSlots();
+      await plain.next();
+      plain.close();
+      const footers = client.subscribeSlotsWithBlockFooters();
+      const event = await footers.next();
+      footers.close();
+      expect(seen).toEqual([false, true]);
+      expect(event?.slot).toBe(1n);
+    } finally {
+      server.forceShutdown();
+    }
+  });
+
+  it('report connection events and stop retrying a rejected request', async () => {
+    let connections = 0;
+    const { server, url, grpc } = await v2Server({
+      subscribeTransactions: (call: {
+        sendMetadata(m: unknown): void;
+        on(e: string, f: () => void): void;
+        emit(e: string, v: unknown): void;
+      }) => {
+        connections += 1;
+        call.sendMetadata(new grpc.Metadata());
+        call.on('data', () =>
+          call.emit('error', { code: grpc.status.INVALID_ARGUMENT, details: 'bad filter' }),
+        );
+      },
+    });
+    try {
+      const stream = new JetstreamClientBuilder()
+        .url(url)
+        .retry(fast)
+        .build()
+        .subscribeTransactions([JetstreamClient.filter('f', ['acc1'])]);
+      const events = stream.events();
+      await expect(stream.next()).rejects.toThrow(/bad filter/);
+      expect(await stream.next()).toBeUndefined();
+      const seen = [];
+      for (let e = await events.recv(); e !== undefined; e = await events.recv()) seen.push(e);
+      expect(seen.map((e) => e.type)).toEqual(['connecting', 'connected', 'disconnected']);
+      expect(seen[0]).toMatchObject({ endpoint: url, attempt: 1 });
+      expect(seen[2]).not.toHaveProperty('retryInMs');
+      expect(connections).toBe(1);
+    } finally {
+      server.forceShutdown();
+    }
+  });
+});

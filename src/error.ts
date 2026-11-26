@@ -56,7 +56,7 @@ export class OrbitflareError extends Error {
   }
 
   static transport(cause: unknown, message?: string): OrbitflareError {
-    const msg = message ?? (cause instanceof Error ? cause.message : String(cause));
+    const msg = message ?? chain(cause);
     return new OrbitflareError('transport', msg, { cause });
   }
 
@@ -159,6 +159,19 @@ export class OrbitflareError extends Error {
         return this;
     }
   }
+}
+
+function chain(err: unknown): string {
+  let out = err instanceof Error ? err.message : String(err);
+  const seen = new Set<unknown>([err]);
+  let source = err instanceof Error ? err.cause : undefined;
+  while (source !== undefined && source !== null && !seen.has(source)) {
+    seen.add(source);
+    const text = source instanceof Error ? source.message : String(source);
+    if (!out.endsWith(text)) out += `: ${text}`;
+    source = source instanceof Error ? source.cause : undefined;
+  }
+  return out;
 }
 
 export function sanitizeUrl(url: string): string {

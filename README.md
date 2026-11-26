@@ -271,6 +271,66 @@ const stream = client.subscribe(request);
 
 `client.subscribe(request)` also accepts a raw `SubscribeRequest` if you'd rather construct it by hand.
 
+### Block footers
+
+Alpenglow block footers arrive as their own `blockFooter` update as soon as the validator reports them, without waiting for the block. Join them with other per-block updates on `(slot, bankId)`. Certificates are opt-in, and their BLS signatures are not verified:
+
+```ts
+import {
+  BlockFooterFilter,
+  Commitment,
+  SubscribeRequestBuilder,
+} from '@orbitflare/sdk/grpc';
+
+const request = new SubscribeRequestBuilder()
+  .blockFooter('footers', new BlockFooterFilter().includeCertificates(true))
+  .commitment(Commitment.Processed)
+  .build();
+
+for await (const update of client.subscribe(request)) {
+  const footer = update.blockFooter;
+  if (footer) {
+    console.log(`slot=${footer.slot} bankId=${footer.bankId} finalCert=${footer.blockFinalCert !== undefined}`);
+  }
+}
+```
+
+### Resuming after a reconnect
+
+`subscribe` sends the same request on every reconnect. `subscribeWith` builds the request for each connection instead, so a reconnect can resume from where the stream left off and pick up your current filters. The callback gets the endpoint, the attempt number, whether this is a reconnect, and the highest slot the stream has seen:
+
+```ts
+const JUPITER = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+const PUMP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
+const stream = client.subscribeWith((info) => ({
+  ...new SubscribeRequestBuilder()
+    .transactions('swaps', new TransactionFilter().vote(false).accountInclude([JUPITER]))
+    .commitment(Commitment.Confirmed)
+    .build(),
+  fromSlot: info.lastSlot === undefined ? undefined : info.lastSlot - 32n,
+}));
+```
+
+Resume a few slots back rather than at `lastSlot + 1`: the last slot may have been cut off part way through, and the replay sends its remaining updates again, so deduplicate by signature.
+
+When a request sets `fromSlot`, the stream first asks the server how far back it can replay. A slot older than that starts at the oldest available one, and a server without replay starts live, instead of failing the subscription. Both are reported as connection events (below).
+
+### Changing filters on a live stream
+
+Yellowstone applies a new request on an open stream in place of the previous one, so filters can change without reconnecting and without missing anything in between. `update` sends one; `handle()` gives a handle that can be passed around:
+
+```ts
+const handle = stream.handle();
+handle.update(
+  new SubscribeRequestBuilder()
+    .transactions('swaps', new TransactionFilter().vote(false).accountInclude([JUPITER, PUMP]))
+    .build(),
+);
+```
+
+`fromSlot` is ignored on an update. A stream opened with `subscribe` keeps the updated request for later reconnects; one opened with `subscribeWith` calls its callback, which should reflect the change.
+
 ## JetStream
 
 ```yaml
@@ -371,6 +431,18 @@ for await (const event of slots) {
 }
 ```
 
+Opt into Alpenglow block footers on the same stream. They arrive as `SLOT_STATUS_BLOCK_FOOTER` events, at most once per slot, and are not ordered relative to `SLOT_STATUS_COMPLETE`. The certificates' BLS signatures are not verified, so treat a footer as the leader's claim, not proof of finality:
+
+```ts
+import { SlotStatus } from '@orbitflare/sdk/jetstream/v2';
+
+for await (const event of client.subscribeSlotsWithBlockFooters()) {
+  if (event.status === SlotStatus.SLOT_STATUS_BLOCK_FOOTER && event.blockFooter) {
+    console.log(`slot=${event.blockFooter.slot} bankHash=${Buffer.from(event.blockFooter.bankHash).toString('hex')}`);
+  }
+}
+```
+
 ## WebSocket
 
 ```ts
@@ -421,7 +493,7 @@ const client = new GeyserClientBuilder()
   .build();
 ```
 
-All three streaming clients reconnect automatically on disconnection. WebSocket also re-subscribes all active subscriptions after reconnecting.
+All three streaming clients reconnect automatically on disconnection. WebSocket also re-subscribes all active subscriptions after reconnecting. A gRPC or JetStream request the server rejects as invalid, unauthenticated, forbidden or unimplemented ends the stream with that error instead of reconnecting, and only a connection that delivered a message resets the retry count.
 
 Configure retry behavior:
 
@@ -439,11 +511,50 @@ const client = new RpcClientBuilder()
   .build();
 ```
 
+### Connection events
+
+Reconnects are invisible in the update stream itself. Every gRPC and JetStream stream (v1 and v2, transactions and slots) also reports its connection lifecycle, for health checks, metrics, or deciding a gap needs backfilling:
+
+```ts
+for await (const event of stream.events()) {
+  switch (event.type) {
+    case 'connecting':
+      console.log(`connecting to ${event.endpoint} (try ${event.attempt})`);
+      break;
+    case 'connected':
+      console.log(`streaming from ${event.endpoint}`);
+      break;
+    case 'disconnected':
+      console.log(
+        event.retryInMs === undefined
+          ? `${event.endpoint} dropped (${event.error}); giving up`
+          : `${event.endpoint} dropped (${event.error}); retrying in ${event.retryInMs}ms`,
+      );
+      break;
+    case 'replayClamped':
+      console.log(`slots ${event.requested}..${event.available} are no longer replayable`);
+      break;
+    case 'replayUnavailable':
+      console.log(`no replay; started live instead of at ${event.requested}`);
+      break;
+    case 'lagged':
+      console.log(`missed ${event.missed} events`);
+      break;
+  }
+}
+```
+
+Events never hold the stream back: a reader that falls behind by more than 256 events gets `lagged` instead. The first call to `events()` also returns what happened before it was called. `recv()` and `tryRecv()` read one event at a time.
+
+### Connection settings
+
+gRPC and JetStream connections send HTTP/2 keepalive pings every 20 seconds (`.keepaliveSecs()`), use a 5 MiB flow-control window so replays and bursts are not throttled by round-trip time, and accept messages up to 64 MiB (grpc-js's own default of 4 MiB rejects some blocks). Change the limit with `.maxDecodingMessageSize(bytes)` on the builder.
+
 ## Environment variables
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `ORBITFLARE_LICENSE_KEY` | RPC, WebSocket | API key appended to endpoint URLs |
+| `ORBITFLARE_LICENSE_KEY` | All clients except Apex | API key: appended to RPC and WebSocket URLs, sent as `x-token` to gRPC and JetStream |
 | `ORBITFLARE_RPC_URL` | RPC | Default endpoint if `.url()` is not called |
 | `ORBITFLARE_APEX_API_KEY` | Apex | Apex API key, a separate credential from the license key |
 | `ORBITFLARE_APEX_URL` | Apex | Default endpoint if `.url()` and `.region()` are not called |
@@ -454,7 +565,7 @@ const client = new RpcClientBuilder()
 
 ## Examples
 
-Fifteen runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
+Seventeen runnable examples live in [`examples/`](./examples), covering every transport in basic and full variants.
 
 ```bash
 git clone https://github.com/orbitflare/orbitflare-sdk-ts.git
@@ -475,11 +586,13 @@ npm run example:ws-full
 npm run example:grpc-basic
 npm run example:grpc-full
 npm run example:grpc-filters
+npm run example:grpc-block-footers
 npm run example:jetstream-basic
 npm run example:jetstream-full
 npm run example:jetstream-filters
 npm run example:jetstream-v2-basic
 npm run example:jetstream-v2-full
+npm run example:jetstream-v2-slots
 ```
 
 The Apex examples send real tipped transfers on mainnet. They read `ORBITFLARE_APEX_API_KEY`, `KEYPAIR_PATH` (a Solana CLI keypair file, default `payer.json`), `SOLANA_RPC_URL`, and optionally `TO` (default: the payer itself), `LAMPORTS` (default 1000) and `ORBITFLARE_APEX_REGION`. `apex-full` sends a legacy transaction over `/send-bin`, a v1 transaction over JSON-RPC and a batch of two, then shows a below-floor tip being refused. Each landed transfer costs the 0.001 SOL tip plus fees.

@@ -1,13 +1,13 @@
 import {
   type ClientDuplexStream,
-  type ClientOptions,
   type ClientReadableStream,
   type ServiceError,
 } from '@grpc/grpc-js';
 
-import { apiKeyInterceptors, parseAddress } from '../address.js';
+import { parseAddress } from '../address.js';
 import { EndpointSet } from '../endpoint.js';
 import { OrbitflareError, sanitizeUrl } from '../error.js';
+import { type ConnectionEvents } from '../events.js';
 import { type Logger, type LogLevel, resolveLogger } from '../logger.js';
 import {
   defaultRetryPolicy,
@@ -16,19 +16,29 @@ import {
   type RetryPolicy,
 } from '../retry.js';
 import {
+  clientOptions,
+  DEFAULT_KEEPALIVE_SECS,
+  DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+  DEFAULT_MAX_MISSED_PONGS,
+  DEFAULT_PING_INTERVAL_SECS,
+  Inbox,
+  Reconnector,
+  sleep,
+  type StreamOptions,
+  toGrpcError,
+} from '../streaming.js';
+import {
   JetstreamV2Client as ProtoV2Client,
   type SlotEvent,
+  type SubscribeSlotsRequest,
   type SubscribeTransactionsRequest,
   type SubscribeTransactionsResponse,
   type TxFilter,
 } from '../proto/jetstream_v2.js';
 
 export type { SlotEvent, SubscribeTransactionsResponse, TxFilter } from '../proto/jetstream_v2.js';
-
-const DEFAULT_PING_INTERVAL_SECS = 10;
-const DEFAULT_MAX_MISSED_PONGS = 3;
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+export { SlotStatus } from '../proto/jetstream_v2.js';
+export { ConnectionEvents, type ConnectionEvent } from '../events.js';
 
 export class TransactionFilter {
   private _accountInclude: string[] = [];
@@ -69,18 +79,6 @@ export class TransactionFilter {
   }
 }
 
-interface JetstreamClientOptions {
-  endpoints: EndpointSet;
-  apiKey?: string;
-  retry: RetryPolicy;
-  timeoutSecs: number;
-  keepaliveSecs: number;
-  pingIntervalSecs: number;
-  maxMissedPongs: number;
-  channelCapacity: number;
-  logger: Logger;
-}
-
 export class TxFilterHandle {
   constructor(private readonly stream: TransactionStream) {}
 
@@ -98,25 +96,20 @@ export class TxFilterHandle {
 }
 
 export class TransactionStream {
-  private buffer: SubscribeTransactionsResponse[] = [];
-  private waiting: ((v: SubscribeTransactionsResponse | undefined) => void)[] = [];
-  private errored?: OrbitflareError;
-  private closed = false;
-  private shutdownRequested = false;
+  private inbox = new Inbox<SubscribeTransactionsResponse>();
   private active = new Map<string, TxFilter>();
   private call?: ClientDuplexStream<SubscribeTransactionsRequest, SubscribeTransactionsResponse>;
+  private abort?: () => void;
 
-  constructor(initial: TxFilter[]) {
+  constructor(
+    private readonly rc: Reconnector,
+    initial: TxFilter[],
+  ) {
     for (const f of initial) this.active.set(f.filterId, f);
   }
 
-  async next(): Promise<SubscribeTransactionsResponse | undefined> {
-    if (this.buffer.length > 0) return this.buffer.shift();
-    if (this.errored) throw this.errored;
-    if (this.closed) return undefined;
-    return new Promise<SubscribeTransactionsResponse | undefined>((resolve) => {
-      this.waiting.push(resolve);
-    });
+  next(): Promise<SubscribeTransactionsResponse | undefined> {
+    return this.inbox.next();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterableIterator<SubscribeTransactionsResponse> {
@@ -129,6 +122,10 @@ export class TransactionStream {
 
   handle(): TxFilterHandle {
     return new TxFilterHandle(this);
+  }
+
+  events(): ConnectionEvents {
+    return this.rc.events.subscribe();
   }
 
   addFilters(filters: TxFilter[]): void {
@@ -146,65 +143,48 @@ export class TransactionStream {
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.shutdownRequested = true;
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    if (!this.inbox.close()) return;
+    this.rc.stop();
+    this.abort?.();
   }
 
   _activeFilters(): TxFilter[] {
     return [...this.active.values()];
   }
 
-  _shouldShutdown(): boolean {
-    return this.shutdownRequested;
-  }
-
-  _setCall(
+  _attach(
     call:
       ClientDuplexStream<SubscribeTransactionsRequest, SubscribeTransactionsResponse> | undefined,
+    abort?: () => void,
   ): void {
     this.call = call;
+    this.abort = abort;
   }
 
   _write(req: SubscribeTransactionsRequest): void {
-    if (this.closed || !this.call) return;
+    if (this.inbox.closed || !this.call) return;
     try {
       this.call.write(req);
     } catch {}
   }
 
   _push(resp: SubscribeTransactionsResponse): void {
-    if (this.closed) return;
-    if (this.waiting.length > 0) {
-      this.waiting.shift()!(resp);
-    } else {
-      this.buffer.push(resp);
-    }
+    this.inbox.push(resp);
   }
 
   _fail(err: OrbitflareError): void {
-    if (this.closed) return;
-    this.errored = err;
-    this.closed = true;
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    this.inbox.fail(err);
   }
 }
 
 export class SlotStream {
-  private buffer: SlotEvent[] = [];
-  private waiting: ((v: SlotEvent | undefined) => void)[] = [];
-  private errored?: OrbitflareError;
-  private closed = false;
-  private shutdownRequested = false;
+  private inbox = new Inbox<SlotEvent>();
+  private abort?: () => void;
 
-  async next(): Promise<SlotEvent | undefined> {
-    if (this.buffer.length > 0) return this.buffer.shift();
-    if (this.errored) throw this.errored;
-    if (this.closed) return undefined;
-    return new Promise<SlotEvent | undefined>((resolve) => {
-      this.waiting.push(resolve);
-    });
+  constructor(private readonly rc: Reconnector) {}
+
+  next(): Promise<SlotEvent | undefined> {
+    return this.inbox.next();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterableIterator<SlotEvent> {
@@ -215,36 +195,31 @@ export class SlotStream {
     }
   }
 
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.shutdownRequested = true;
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+  events(): ConnectionEvents {
+    return this.rc.events.subscribe();
   }
 
-  _shouldShutdown(): boolean {
-    return this.shutdownRequested;
+  close(): void {
+    if (!this.inbox.close()) return;
+    this.rc.stop();
+    this.abort?.();
+  }
+
+  _onAbort(abort: (() => void) | undefined): void {
+    this.abort = abort;
   }
 
   _push(event: SlotEvent): void {
-    if (this.closed) return;
-    if (this.waiting.length > 0) {
-      this.waiting.shift()!(event);
-    } else {
-      this.buffer.push(event);
-    }
+    this.inbox.push(event);
   }
 
   _fail(err: OrbitflareError): void {
-    if (this.closed) return;
-    this.errored = err;
-    this.closed = true;
-    while (this.waiting.length > 0) this.waiting.shift()!(undefined);
+    this.inbox.fail(err);
   }
 }
 
 export class JetstreamClient {
-  constructor(private readonly opts: JetstreamClientOptions) {}
+  constructor(private readonly opts: StreamOptions) {}
 
   static filter(filterId: string, accountInclude: string[]): TxFilter {
     return {
@@ -259,14 +234,30 @@ export class JetstreamClient {
   }
 
   subscribeTransactions(filters: TxFilter[]): TransactionStream {
-    const stream = new TransactionStream(filters);
-    void this.driveTransactions(stream);
+    const rc = new Reconnector(this.opts, 'jetstream-v2 transactions');
+    const stream = new TransactionStream(rc, filters);
+    void rc.run(
+      (url, idx) => runTxConnection(url, idx, rc, stream),
+      (err) => stream._fail(err),
+    );
     return stream;
   }
 
   subscribeSlots(): SlotStream {
-    const stream = new SlotStream();
-    void this.driveSlots(stream);
+    return this.subscribeSlotsWith({ includeBlockFooter: false });
+  }
+
+  subscribeSlotsWithBlockFooters(): SlotStream {
+    return this.subscribeSlotsWith({ includeBlockFooter: true });
+  }
+
+  private subscribeSlotsWith(request: SubscribeSlotsRequest): SlotStream {
+    const rc = new Reconnector(this.opts, 'jetstream-v2 slots');
+    const stream = new SlotStream(rc);
+    void rc.run(
+      (url, idx) => runSlotConnection(url, idx, rc, request, stream),
+      (err) => stream._fail(err),
+    );
     return stream;
   }
 
@@ -295,94 +286,15 @@ export class JetstreamClient {
         }),
     );
   }
-
-  private async driveTransactions(stream: TransactionStream): Promise<void> {
-    const { logger } = this.opts;
-    let attempt = 0;
-    while (!stream._shouldShutdown()) {
-      attempt += 1;
-      const idx = this.opts.endpoints.pick();
-      const url = this.opts.endpoints.get(idx);
-      logger.info('connecting (jetstream-v2 transactions)', {
-        endpoint: sanitizeUrl(url),
-        attempt,
-      });
-
-      try {
-        await runTxConnection(url, stream, this.opts, () => {
-          attempt = 0;
-          logger.info('connected, streaming (jetstream-v2 transactions)');
-        });
-        this.opts.endpoints.markSuccess(idx);
-        return;
-      } catch (e) {
-        this.opts.endpoints.markFailure(idx);
-        const err = e instanceof OrbitflareError ? e : OrbitflareError.transport(e);
-        if (!hasAttemptsLeft(this.opts.retry, attempt)) {
-          stream._fail(err.withEndpoint(url));
-          return;
-        }
-        const delayMs = delayForAttempt(this.opts.retry, attempt);
-        logger.warn('reconnecting (jetstream-v2 transactions)', {
-          error: err,
-          endpoint: sanitizeUrl(url),
-          attempt,
-          delayMs,
-        });
-        await sleep(delayMs);
-      }
-    }
-  }
-
-  private async driveSlots(stream: SlotStream): Promise<void> {
-    const { logger } = this.opts;
-    let attempt = 0;
-    while (!stream._shouldShutdown()) {
-      attempt += 1;
-      const idx = this.opts.endpoints.pick();
-      const url = this.opts.endpoints.get(idx);
-      logger.info('connecting (jetstream-v2 slots)', { endpoint: sanitizeUrl(url), attempt });
-
-      try {
-        await runSlotConnection(url, stream, this.opts, () => {
-          attempt = 0;
-          logger.info('connected, streaming (jetstream-v2 slots)');
-        });
-        this.opts.endpoints.markSuccess(idx);
-        return;
-      } catch (e) {
-        this.opts.endpoints.markFailure(idx);
-        const err = e instanceof OrbitflareError ? e : OrbitflareError.transport(e);
-        if (!hasAttemptsLeft(this.opts.retry, attempt)) {
-          stream._fail(err.withEndpoint(url));
-          return;
-        }
-        const delayMs = delayForAttempt(this.opts.retry, attempt);
-        logger.warn('reconnecting (jetstream-v2 slots)', {
-          error: err,
-          endpoint: sanitizeUrl(url),
-          attempt,
-          delayMs,
-        });
-        await sleep(delayMs);
-      }
-    }
-  }
 }
 
-function makeClient(url: string, opts: JetstreamClientOptions): ProtoV2Client {
+function makeClient(url: string, opts: StreamOptions): ProtoV2Client {
   const { target, credentials } = parseAddress(url);
-  const clientOpts: Partial<ClientOptions> = {
-    interceptors: apiKeyInterceptors(opts.apiKey),
-    'grpc.keepalive_time_ms': opts.keepaliveSecs * 1000,
-    'grpc.keepalive_timeout_ms': opts.timeoutSecs * 1000,
-    'grpc.keepalive_permit_without_calls': 1,
-  };
-  return new ProtoV2Client(target, credentials, clientOpts);
+  return new ProtoV2Client(target, credentials, clientOptions(opts));
 }
 
 async function unaryWithFailover<T>(
-  opts: JetstreamClientOptions,
+  opts: StreamOptions,
   call: (client: ProtoV2Client) => Promise<T>,
 ): Promise<T> {
   let attempt = 0;
@@ -415,11 +327,11 @@ async function unaryWithFailover<T>(
 
 async function runTxConnection(
   url: string,
+  idx: number,
+  rc: Reconnector,
   stream: TransactionStream,
-  opts: JetstreamClientOptions,
-  onConnected: () => void,
 ): Promise<void> {
-  const client = makeClient(url, opts);
+  const client = makeClient(url, rc.opts);
 
   let call: ClientDuplexStream<SubscribeTransactionsRequest, SubscribeTransactionsResponse>;
   try {
@@ -428,7 +340,6 @@ async function runTxConnection(
     client.close();
     throw OrbitflareError.transport(e);
   }
-  stream._setCall(call);
 
   let intervalsSinceTraffic = 0;
   let pingId = 1;
@@ -443,19 +354,24 @@ async function runTxConnection(
 
   const cleanup = () => {
     if (pingTimer) clearInterval(pingTimer);
-    stream._setCall(undefined);
+    stream._attach(undefined);
     try {
-      call.end();
+      call.cancel();
     } catch {}
     client.close();
   };
 
+  const markConnected = () => {
+    if (connected) return;
+    connected = true;
+    rc.onConnected(idx);
+  };
+
+  call.on('metadata', markConnected);
   call.on('data', (resp: SubscribeTransactionsResponse) => {
-    if (!connected) {
-      connected = true;
-      onConnected();
-    }
+    markConnected();
     intervalsSinceTraffic = 0;
+    rc.onMessage();
     stream._push(resp);
   });
   call.on('error', (e) => {
@@ -467,6 +383,14 @@ async function runTxConnection(
     rejectDone(OrbitflareError.stream('stream ended'));
   });
 
+  stream._attach(call, () => {
+    resolveDone();
+    cleanup();
+  });
+  if (rc.shouldStop) {
+    resolveDone!();
+    cleanup();
+  }
   const active = stream._activeFilters();
   if (active.length > 0) {
     try {
@@ -478,14 +402,14 @@ async function runTxConnection(
   }
 
   pingTimer = setInterval(() => {
-    if (stream._shouldShutdown()) {
-      cleanup();
+    if (rc.shouldStop) {
       resolveDone();
+      cleanup();
       return;
     }
-    if (intervalsSinceTraffic >= opts.maxMissedPongs) {
+    if (intervalsSinceTraffic >= rc.opts.maxMissedPongs) {
       cleanup();
-      rejectDone(OrbitflareError.stream(`no traffic after ${opts.maxMissedPongs} pings`));
+      rejectDone(OrbitflareError.stream(`no traffic after ${rc.opts.maxMissedPongs} pings`));
       return;
     }
     try {
@@ -496,28 +420,28 @@ async function runTxConnection(
       cleanup();
       rejectDone(OrbitflareError.stream('outbound closed'));
     }
-  }, opts.pingIntervalSecs * 1000);
+  }, rc.opts.pingIntervalSecs * 1000);
 
   await done;
 }
 
 async function runSlotConnection(
   url: string,
+  idx: number,
+  rc: Reconnector,
+  request: SubscribeSlotsRequest,
   stream: SlotStream,
-  opts: JetstreamClientOptions,
-  onConnected: () => void,
 ): Promise<void> {
-  const client = makeClient(url, opts);
+  const client = makeClient(url, rc.opts);
 
   let call: ClientReadableStream<SlotEvent>;
   try {
-    call = client.subscribeSlots({});
+    call = client.subscribeSlots(request);
   } catch (e) {
     client.close();
     throw OrbitflareError.transport(e);
   }
 
-  let shutdownTimer: NodeJS.Timeout | undefined;
   let resolveDone: () => void;
   let rejectDone: (err: OrbitflareError) => void;
   const done = new Promise<void>((res, rej) => {
@@ -526,7 +450,7 @@ async function runSlotConnection(
   });
 
   const cleanup = () => {
-    if (shutdownTimer) clearInterval(shutdownTimer);
+    stream._onAbort(undefined);
     try {
       call.cancel();
     } catch {}
@@ -534,11 +458,16 @@ async function runSlotConnection(
   };
 
   let connected = false;
+  const markConnected = () => {
+    if (connected) return;
+    connected = true;
+    rc.onConnected(idx);
+  };
+
+  call.on('metadata', markConnected);
   call.on('data', (event: SlotEvent) => {
-    if (!connected) {
-      connected = true;
-      onConnected();
-    }
+    markConnected();
+    rc.onMessage();
     stream._push(event);
   });
   call.on('error', (e) => {
@@ -550,20 +479,16 @@ async function runSlotConnection(
     rejectDone(OrbitflareError.stream('stream ended'));
   });
 
-  shutdownTimer = setInterval(() => {
-    if (stream._shouldShutdown()) {
-      cleanup();
-      resolveDone();
-    }
-  }, 1000);
+  stream._onAbort(() => {
+    resolveDone();
+    cleanup();
+  });
+  if (rc.shouldStop) {
+    resolveDone!();
+    cleanup();
+  }
 
   await done;
-}
-
-function toGrpcError(e: any): OrbitflareError {
-  const code = typeof e?.code === 'number' ? e.code : 2;
-  const message = typeof e?.details === 'string' ? e.details : (e?.message ?? 'grpc error');
-  return OrbitflareError.grpc(code, message);
 }
 
 export class JetstreamClientBuilder {
@@ -572,10 +497,11 @@ export class JetstreamClientBuilder {
   private _apiKey?: string;
   private _retry: RetryPolicy = defaultRetryPolicy();
   private _timeoutSecs = 30;
-  private _keepaliveSecs = 60;
+  private _keepaliveSecs = DEFAULT_KEEPALIVE_SECS;
   private _pingIntervalSecs = DEFAULT_PING_INTERVAL_SECS;
   private _maxMissedPongs = DEFAULT_MAX_MISSED_PONGS;
   private _channelCapacity = 4096;
+  private _maxDecodingMessageSize = DEFAULT_MAX_DECODING_MESSAGE_SIZE;
   private _logger?: Logger;
   private _logLevel?: LogLevel;
 
@@ -647,6 +573,11 @@ export class JetstreamClientBuilder {
     return this;
   }
 
+  maxDecodingMessageSize(bytes: number): this {
+    this._maxDecodingMessageSize = bytes;
+    return this;
+  }
+
   build(): JetstreamClient {
     const url = this._url ?? process.env.ORBITFLARE_JETSTREAM_URL;
     if (!url) {
@@ -663,6 +594,7 @@ export class JetstreamClientBuilder {
       pingIntervalSecs: this._pingIntervalSecs,
       maxMissedPongs: this._maxMissedPongs,
       channelCapacity: this._channelCapacity,
+      maxDecodingMessageSize: this._maxDecodingMessageSize,
       logger: resolveLogger(this._logger, this._logLevel),
     });
   }
